@@ -1,0 +1,47 @@
+
+
+trainer:
+  max_epochs: 100
+  accelerator: gpu
+  devices: 1
+  num_nodes: 1
+  strategy: ddp_find_unused_parameters_true
+  precision: bf16-mixed
+  # gradient clipping
+  # gradient_clip_val: 1.0
+  # gradient_clip_algorithm: norm
+  # gradient accumulation (accumulate gradients for N steps before optimizer step)
+  # accumulate_grad_batches: 2
+  callbacks:
+  - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+    init_args:
+      dirpath: checkpoints/jepa
+      filename: "JEPA-{epoch:03d}-{val/loss:.4f}"
+      monitor: val/loss
+      mode: min
+      save_top_k: 1                        # best checkpoint
+      save_last: true                      # plus a copy of the final epoch
+      auto_insert_metric_name: false       # keep filename clean
+      every_n_epochs: 1
+      save_on_train_epoch_end: true
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: "JEPA"
+      name: "PointMaze/JEPA"
+      log_model: true
+
+
+model:
+  encoder_weights: null
+  initial_lr: 1e-4
+  final_lr: 1e-5
+  warmup_steps: 1000
+
+
+data:
+  data_path: data/train_trajectories.npz
+  batch_size: 64
+  num_workers: 2
+  pin_memory: true
+  val_size: 0.1
