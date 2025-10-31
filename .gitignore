@@ -207,7 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 # Custom
-data/
+# data/
 MUJOCO_LOG.TXT
 *.mp4
 *.html
