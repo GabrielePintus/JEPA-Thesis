@@ -4,7 +4,7 @@ import torch.nn as nn
 
 
 class ConvPredictor(nn.Module):
-    def __init__(self, in_channels=22, hidden_channels=44, out_channels=20):
+    def __init__(self, in_channels=22, hidden_channels=64, out_channels=20):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
@@ -78,9 +78,9 @@ class InverseDynamics(nn.Module):
         )
         self.fc = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(hidden_dim, 64),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(64, action_dim),
+            nn.Linear(hidden_dim, action_dim),
         )
 
     def forward(self, z_t, z_next):

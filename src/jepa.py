@@ -113,13 +113,17 @@ class JEPA(L.LightningModule):
         action_pred = self.idm(z_state, z_next_state)
 
         # Compute loss - Stopgrad on z_next_state
-        loss_prediction  = self.prediction_cost(z_next_state_pred, z_next_state.detach())
+        loss_prediction_visual  = self.prediction_cost(
+            z_next_state_pred[:, 4:, :, :],
+            z_next_state.detach()[:, 4:, :, :]
+        )
+        loss_prediction_proprio = self.prediction_cost(
+            z_next_state_pred[:, :4, :, :],
+            z_next_state.detach()[:, :4, :, :]
+        )
+        loss_prediction = loss_prediction_visual + loss_prediction_proprio
         loss_idm = self.idm_cost(action_pred, action)
         loss = loss_prediction + loss_idm * 0.1
-
-        # Encode
-        # with torch.no_grad():
-        #     z_frame = self.encoder_student(frame).detach()
 
         # Reconstruct
         frame_recon = self.decoder(z_state.detach())
@@ -129,6 +133,8 @@ class JEPA(L.LightningModule):
 
         return {'loss': loss,
                 'loss_prediction': loss_prediction,
+                'loss_prediction_visual': loss_prediction_visual,
+                'loss_prediction_proprio': loss_prediction_proprio,
                 'loss_idm': loss_idm,
                 'loss_reconstruction': loss_reconstruction
                 }
