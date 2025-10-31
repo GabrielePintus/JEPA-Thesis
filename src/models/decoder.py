@@ -7,7 +7,7 @@ class MeNet6Decoder128(nn.Module):
     Input:  (B, 16, 28, 28)
     Output: (B, 3, 128, 128)
     """
-    def __init__(self, latent_channels=16, out_channels=3):
+    def __init__(self, latent_channels=20, out_channels=3):
         super().__init__()
         self.net = nn.Sequential(
             # Mirror of Conv2d(32,16,1,1)
@@ -35,9 +35,9 @@ class MeNet6Decoder128(nn.Module):
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
 
-            # Final refinement + resize to exact 128×128
+            # Final refinement + resize to exact 96×96
             nn.ConvTranspose2d(16, out_channels, kernel_size=3, stride=1, padding=1),
-            nn.Upsample(size=(128, 128), mode="bilinear", align_corners=False),
+            nn.Upsample(size=(96, 96), mode="bilinear", align_corners=False),
             nn.Sigmoid(),
         )
 

@@ -18,12 +18,12 @@ class JEPA(L.LightningModule):
     def __init__(
         self,
         encoder_weights=None,
-        encoder_momentum=0.99,
+        encoder_momentum=0.999,
         initial_lr=1e-4,
         final_lr=1e-6,
         weight_decay=1e-4,
         warmup_steps=1000,
-        target_shape=(28, 28)
+        target_shape=(20, 20)
     ):
         super().__init__()
         self.automatic_optimization = False
@@ -54,7 +54,7 @@ class JEPA(L.LightningModule):
         # Losses
         self.prediction_cost = nn.MSELoss()
         self.idm_cost = nn.MSELoss()
-        self.reconstruction_cost = nn.L1Loss()
+        self.reconstruction_cost = nn.MSELoss()
 
 
     def encode(
@@ -89,8 +89,8 @@ class JEPA(L.LightningModule):
 
     def predict_next(self, z_state, z_action):
         """Predicts the next latent state given context latent and action."""
-        x = torch.cat([z_state, z_action], dim=1)
-        z_next_state_pred = self.predictor(x)
+        z = torch.cat([z_state, z_action], dim=1)
+        z_next_state_pred = self.predictor(z) + z_state
         return z_next_state_pred
         
 
@@ -118,11 +118,11 @@ class JEPA(L.LightningModule):
         loss = loss_prediction + loss_idm * 0.1
 
         # Encode
-        with torch.no_grad():
-            z_frame = self.encoder_student(frame).detach()
+        # with torch.no_grad():
+        #     z_frame = self.encoder_student(frame).detach()
 
         # Reconstruct
-        frame_recon = self.decoder(z_frame)
+        frame_recon = self.decoder(z_state.detach())
 
         # Compute reconstruction loss
         loss_reconstruction = self.reconstruction_cost(frame_recon, frame)
