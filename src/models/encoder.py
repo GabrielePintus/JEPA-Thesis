@@ -2,35 +2,26 @@ import torch
 import torch.nn as nn
 
 
-class MeNet6_128(nn.Module):
+class MeNet6(nn.Module):
     def __init__(self, input_channels=3):
         super().__init__()
-        self.activation = nn.GELU()
+        self.activation = nn.ReLU()
 
         self.net = nn.Sequential(
-            # 128 -> 124
             nn.Conv2d(input_channels, 16, kernel_size=5, stride=1),
-            nn.GroupNorm(4, 16),
+            nn.GroupNorm(4, 16, eps=1e-05, affine=True),
             self.activation,
 
-            # 124 -> 62
             nn.Conv2d(16, 32, kernel_size=5, stride=2),
-            nn.GroupNorm(8, 32),
+            nn.GroupNorm(8, 32, eps=1e-05, affine=True),
             self.activation,
 
-            # 62 -> 30
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(16, 64),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1),
+            nn.GroupNorm(8, 32, eps=1e-05, affine=True),
             self.activation,
 
-            # 30 -> 28
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.GroupNorm(16, 64),
-            self.activation,
-
-            # 28 -> 28
-            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 32),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(8, 32, eps=1e-05, affine=True),
             self.activation,
 
             nn.Conv2d(32, 16, kernel_size=1, stride=1),
@@ -60,7 +51,7 @@ class Expander2D(nn.Module):
 class JEPAEncoder(nn.Module):
     def __init__(self, input_channels=3):
         super().__init__()
-        self.backbone = MeNet6_128(input_channels=input_channels)
+        self.backbone = MeNet6(input_channels=input_channels)
         self.propio_encoder = Expander2D()
 
     def forward(self, img, proprio=None):

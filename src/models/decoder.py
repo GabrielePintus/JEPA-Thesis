@@ -10,34 +10,31 @@ class MeNet6Decoder128(nn.Module):
     def __init__(self, latent_channels=20, out_channels=3):
         super().__init__()
         self.net = nn.Sequential(
-            # Mirror of Conv2d(32,16,1,1)
-            nn.ConvTranspose2d(latent_channels, 32, kernel_size=1, stride=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
+            # 7×7 → 14×14
+            nn.ConvTranspose2d(latent_channels, 128, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.GELU(),
 
-            # Mirror of Conv2d(64,32,3,1,p1)
-            nn.ConvTranspose2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
+            # 14×14 → 28×28
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
 
-            # Mirror of Conv2d(64,64,3,1)
-            nn.ConvTranspose2d(64, 64, kernel_size=3, stride=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
+            # 28×28 → 56×56
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(4, 32),
+            nn.GELU(),
 
-            # Mirror of Conv2d(32,64,4,2,p1)  (upsample ×2)
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # 28 -> 56
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
+            # Refinement (keep 56×56)
+            nn.ConvTranspose2d(32, 16, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(4, 16),
+            nn.GELU(),
 
-            # Mirror of Conv2d(16,32,5,2) (upsample ×2)
-            nn.ConvTranspose2d(32, 16, kernel_size=6, stride=2, padding=2),  # 56 -> 112
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-
-            # Final refinement + resize to exact 96×96
+            # Final RGB reconstruction to 56×56
             nn.ConvTranspose2d(16, out_channels, kernel_size=3, stride=1, padding=1),
-            nn.Upsample(size=(96, 96), mode="bilinear", align_corners=False),
+
+            # 56×56 → 64×64 (exact match)
+            nn.Upsample(size=(64, 64), mode="bilinear", align_corners=False),
             nn.Sigmoid(),
         )
 

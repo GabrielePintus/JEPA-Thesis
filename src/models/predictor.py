@@ -4,7 +4,7 @@ import torch.nn as nn
 
 
 class ConvPredictor(nn.Module):
-    def __init__(self, in_channels=22, hidden_channels=64, out_channels=20):
+    def __init__(self, in_channels=22, hidden_channels=32, out_channels=20):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
