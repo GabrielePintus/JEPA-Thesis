@@ -24,10 +24,7 @@ import zipfile
 # ----------------------------
 # Environment import
 # ----------------------------
-try:
-    from envs.merged import PointMazeEnv  # repo-style import
-except Exception:
-    from merged import PointMazeEnv       # local import
+from envs.pointmaze import PointMazeEnv
 
 os.environ["MUJOCO_GL"] = "egl"
 
@@ -89,8 +86,9 @@ class UniformDirectionPolicy:
 
 @dataclass
 class CollectorConfig:
-    T: int = 91
-    episodes: int = 100
+    T: int = 100
+    episodes: int = 1000
+    action_repeat: int = 1
     seed: Optional[int] = 0
     store_images: bool = False
     clip_to_action_space: bool = True
@@ -224,7 +222,11 @@ def collect_trajectories(
             a_vec = policy.sample() * cfg.action_scale
             a = _scale_and_clip(a_vec, env) if cfg.clip_to_action_space else a_vec
             act[ep, t, :len(a)] = a
-            next_obs_dict, _, _, _, _ = env.step(a)
+            # Repeat same action cfg.action_repeat times
+            for _ in range(cfg.action_repeat):
+                next_obs_dict, _, _, _, _ = env.step(a)
+
+            # After all repeats, record the resulting observation/frame
             s_next = next_obs_dict["observation"].astype(np.float32)
             obs[ep, t + 1] = s_next
 
@@ -253,6 +255,7 @@ def main():
     parser.add_argument("--T", type=int, default=91)
     parser.add_argument("--kappa", type=float, default=5.0)
     parser.add_argument("--step-max", type=float, default=2.45)
+    parser.add_argument("--action-repeat", type=int, default=1, help="Number of repeated environment steps per sampled action.")
     parser.add_argument("--policy", choices=["vonmises", "uniform"], default="vonmises")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default="pointmaze_eps_major.npz")
@@ -293,6 +296,7 @@ def main():
         store_images=args.store_images,
         clip_to_action_space=not args.no_clip,
         action_scale=args.action_scale,
+        action_repeat=args.action_repeat,
     )
 
     data = collect_trajectories(cfg, policy=policy, maze_bank=maze_bank,
