@@ -141,7 +141,7 @@ def make_env(maze_map=None, seed: Optional[int] = 0) -> PointMazeEnv:
         camera_distance=side,
         continuing_task=True,
         reset_target=False,
-        render_img_size=(224, 224),
+        render_img_size=(64, 64),
         render_mode="rgb_array",
     )
     env.reset(seed=seed)
