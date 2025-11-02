@@ -143,116 +143,135 @@ from typing import Dict
 
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Dict
+
 
 class TemporalVICRegLoss(nn.Module):
     """
-    Temporal VICReg loss (variance + covariance terms) consistent with
-    the official PLDM implementation.
+    Temporal VICReg as in PLDM (without similarity terms):
+      - std/cov across batch at a single time step (default t=0)
+      - std_t/cov_t across time on steps t>=1
 
-    Args:
-        std_coeff:  weight for variance (std) regularizer
-        cov_coeff:  weight for covariance regularizer
-        std_coeff_t: weight for temporal variance regularizer
-        cov_coeff_t: weight for temporal covariance regularizer
-        std_margin: target std deviation (gamma in paper)
-        std_margin_t: same but for temporal term
-        adjust_cov: whether to divide covariance loss by (D-1)
+    Inputs:
+        z: (B, T, D) sequence embeddings.
     """
 
     def __init__(
         self,
         std_coeff: float = 25.0,
-        cov_coeff: float = 1.0
+        cov_coeff: float = 1.0,
+        std_coeff_t: float = 25.0,
+        cov_coeff_t: float = 1.0,
+        std_margin: float = 1.0,
+        std_margin_t: float = 1.0,
+        adjust_cov: bool = True,
+        eps: float = 1e-4,
+        use_time_index_for_batch_terms: int = 0,  # which t to use for the batch VICReg terms
+        projector: Optional[nn.Module] = None,    # e.g., nn.Identity() or an MLP
     ):
         super().__init__()
         self.std_coeff = std_coeff
         self.cov_coeff = cov_coeff
+        self.std_coeff_t = std_coeff_t
+        self.cov_coeff_t = cov_coeff_t
+        self.std_margin = std_margin
+        self.std_margin_t = std_margin_t
+        self.adjust_cov = adjust_cov
+        self.eps = eps
+        self.t0 = use_time_index_for_batch_terms
+        self.projector = projector if projector is not None else nn.Identity()
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
+    @staticmethod
+    def _offdiag_cov_loss(x_centered: torch.Tensor, denom_features: int, adjust_cov: bool) -> torch.Tensor:
+        """
+        Compute off-diagonal covariance penalty per group.
+        x_centered: (G, K, D)
+        Returns: (G,) — loss per group
+        """
+        K = x_centered.shape[1]
+        cov = torch.einsum("gkd,gke->gde", x_centered, x_centered) / max(K - 1, 1)
+
+        diag_sq_sum = (cov.diagonal(dim1=-2, dim2=-1) ** 2).sum(dim=-1)
+        full_sq_sum = (cov ** 2).sum(dim=(-1, -2))
+        offdiag = (full_sq_sum - diag_sq_sum) / denom_features
+
+        if adjust_cov and denom_features > 1:
+            offdiag = offdiag / (denom_features - 1)
+
+        return offdiag  # (G,)
+
+    # --------------------------------------------------------------
+    def _std_hinge(self, x_centered: torch.Tensor, margin: float) -> torch.Tensor:
+        """
+        Hinge loss to enforce std >= margin.
+        x_centered: (G, K, D)
+        Returns: (G,)
+        """
+        std = torch.sqrt(x_centered.var(dim=1, unbiased=False) + self.eps)
+        return F.relu(margin - std).mean(dim=-1)
+
+    # --------------------------------------------------------------
     def forward(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        z: (B, T, D)
+        Compute VICReg-style regularization across batch and time.
+
+        Args:
+            z: (B, T, D)
         """
-        # compute in float32 for stability under bf16 AMP
-        z32 = z.float()
+        assert z.ndim == 3, f"Expected (B, T, D), got {z.shape}"
+        B, T, D = z.shape
+        assert T >= 2, "Need at least two timesteps for temporal terms."
 
-        # ----- Temporal stats (need T >= 2) -----
-        B, T, _ = z32.shape
-        if T >= 2:
-            std_t = self.temporal_var_loss(z32)
-            cov_t = self.temporal_cov_loss(z32)
-            std_t_term = self.std_coeff * std_t
-            cov_t_term = self.cov_coeff * cov_t
-        else:
-            raise ValueError("TemporalVICRegLoss requires T >= 2")
+        # Optional projection (MLP or Identity)
+        z_proj = self.projector(z)
+        Dp = z_proj.shape[-1]
 
-        total_loss = std_t_term + cov_t_term
+        # -----------------------------
+        # Batch-level VICReg (across batch at time t0)
+        # -----------------------------
+        t0 = min(self.t0, T - 1)
+        xb = z_proj[:, t0, :]  # (B, Dp)
+        xb = xb - xb.mean(dim=0, keepdim=True)  # center across batch
+        xb = xb.unsqueeze(0)  # (1, B, Dp)
 
-        # cast back to original dtype
+        std_loss = torch.zeros((), device=z.device)
+        cov_loss = torch.zeros((), device=z.device)
+        if self.std_coeff:
+            std_loss = self._std_hinge(xb, self.std_margin).mean()
+        if self.cov_coeff:
+            cov_loss = self._offdiag_cov_loss(xb, Dp, self.adjust_cov).mean()
+
+        # -----------------------------
+        # Temporal VICReg (across time within each sample)
+        # -----------------------------
+        xt = z_proj[:, 1:, :] - z_proj[:, 1:, :].mean(dim=1, keepdim=True)  # (B, T-1, Dp)
+        std_loss_t = torch.zeros((), device=z.device)
+        cov_loss_t = torch.zeros((), device=z.device)
+
+        if self.std_coeff_t:
+            std_loss_t = self._std_hinge(xt, self.std_margin_t).mean()
+        if self.cov_coeff_t:
+            cov_loss_t = self._offdiag_cov_loss(xt, Dp, self.adjust_cov).mean()
+
+        # -----------------------------
+        # Combine losses
+        # -----------------------------
+        total_loss = (
+            self.std_coeff * std_loss
+            + self.cov_coeff * cov_loss
+            + self.std_coeff_t * std_loss_t
+            + self.cov_coeff_t * cov_loss_t
+        )
+
         return {
-            "std_t": std_t_term.to(z.dtype),
-            "cov_t": cov_t_term.to(z.dtype),
-            "loss":  total_loss.to(z.dtype),
+            "loss": total_loss,
+            "std_loss": std_loss.detach(),
+            "cov_loss": cov_loss.detach(),
+            "std_loss_t": std_loss_t.detach(),
+            "cov_loss_t": cov_loss_t.detach(),
         }
-        
-
-    def temporal_cov_loss(self, Z: torch.Tensor) -> torch.Tensor:
-        """
-        Compute covariance regularization loss for tensor Z of shape (B, T, D).
-
-        Args:
-            Z: torch.Tensor, shape (batch, time, dim)
-
-        Returns:
-            torch.Tensor: scalar covariance loss
-        """
-        B, T, D = Z.shape
-        cov_loss = 0.0
-
-        for t in range(T):
-            Z_t = Z[:, t, :]  # (B, D)
-            Z_t_mean = Z_t.mean(dim=0, keepdim=True)  # (1, D)
-            Z_t_centered = Z_t - Z_t_mean
-            # Covariance matrix (D, D)
-            C_t = (Z_t_centered.T @ Z_t_centered) / (B - 1)
-            # Square off-diagonal entries only
-            off_diag = C_t.flatten()[~torch.eye(D, dtype=bool, device=Z.device).flatten()]
-            cov_loss += (off_diag ** 2).mean()  # (1/D) * Σ_{i≠j} C^2
-
-        cov_loss = cov_loss / T
-        return cov_loss
-    
-    def temporal_var_loss(self, Z: torch.Tensor, gamma: float = 1.0, eps: float = 1e-4) -> torch.Tensor:
-
-        """
-        Compute the temporal variance regularization loss.
-
-        Args:
-            Z: torch.Tensor of shape (B, T, D)
-            gamma: hinge threshold
-            eps: numerical stability term
-
-        Returns:
-            torch.Tensor: scalar variance loss
-        """
-        B, T, D = Z.shape
-
-        # Variance across batch dimension for each (t, j)
-        var_tj = Z.var(dim=0, unbiased=False)  # (T, D)
-
-        # Compute sqrt(var + eps)
-        std_tj = torch.sqrt(var_tj + eps)
-
-        # Apply hinge loss: max(0, gamma - std)
-        hinge = torch.relu(gamma - std_tj)
-
-        # Average over time and dimension
-        var_loss = hinge.mean()
-
-        return var_loss
-        
-
-
-
-
 

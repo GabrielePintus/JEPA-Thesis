@@ -12,24 +12,24 @@ trainer:
   # gradient_clip_algorithm: norm
   # gradient accumulation (accumulate gradients for N steps before optimizer step)
   # accumulate_grad_batches: 2
-  # callbacks:
-  # - class_path: lightning.pytorch.callbacks.ModelCheckpoint
-  #   init_args:
-  #     dirpath: checkpoints/jepa
-  #     filename: "JEPA-{epoch:03d}-{val/loss:.4f}"
-  #     monitor: val/loss
-  #     mode: min
-  #     save_top_k: 1                        # best checkpoint
-  #     save_last: true                      # plus a copy of the final epoch
-  #     auto_insert_metric_name: false       # keep filename clean
-  #     every_n_epochs: 1
-  #     save_on_train_epoch_end: true
-  # logger:
-  #   class_path: lightning.pytorch.loggers.WandbLogger
-  #   init_args:
-  #     project: "JEPA"
-  #     name: "PointMaze/JEPA"
-  #     log_model: true
+  callbacks:
+  - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+    init_args:
+      dirpath: checkpoints/jepa
+      filename: "JEPA-{epoch:03d}-{val/loss:.4f}"
+      monitor: val/loss
+      mode: min
+      save_top_k: 1                        # best checkpoint
+      save_last: true                      # plus a copy of the final epoch
+      auto_insert_metric_name: false       # keep filename clean
+      every_n_epochs: 1
+      save_on_train_epoch_end: true
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: "JEPA"
+      name: "PointMaze/JEPA"
+      log_model: true
 
 
 model:
@@ -41,10 +41,9 @@ model:
 
 data:
   data_path: data/train_trajectories_1000_100_4_64.npz
-  seq_len: 100
-  batch_size: 1           # Effective batch size = batch_size * seq_len
-  # batch_size: 128
+  seq_len: 50
+  batch_size: 32
   num_workers: 2
   pin_memory: true
   val_size: 0.1
-  epoch_fraction: 0.5
+  epoch_fraction: 1.0
