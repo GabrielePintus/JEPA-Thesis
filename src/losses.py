@@ -1,79 +1,143 @@
-# losses.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict
 
-def off_diagonal(m: torch.Tensor) -> torch.Tensor:
-    n = m.size(0)
-    return m.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 class TemporalVICRegLoss(nn.Module):
     """
-    Temporal VICReg (PLDM-style) regularizer:
+    Temporal VICReg loss (variance + covariance terms) consistent with
+    the official PLDM implementation.
 
-      L = L_sim
-        + alpha * L_var_time(Z_true)       # variance over time per (b, feature)
-        + beta  * L_cov_batch_per_t(Z_true)# off-diag batch covariance per time step
-        + delta * L_time_smooth(Z_true)    # ||Z_{t+1}-Z_t||^2
-
-    Accepts sequences:
-      Z_pred, Z_true: (T,B,C,H,W) or (T,B,D)
+    Args:
+        std_coeff:  weight for variance (std) regularizer
+        cov_coeff:  weight for covariance regularizer
+        std_coeff_t: weight for temporal variance regularizer
+        cov_coeff_t: weight for temporal covariance regularizer
+        std_margin: target std deviation (gamma in paper)
+        std_margin_t: same but for temporal term
+        adjust_cov: whether to divide covariance loss by (D-1)
     """
-    def __init__(self, alpha=25.0, beta=1.0, delta=1.0, gamma=1.0, eps=1e-4):
+
+    def __init__(
+        self,
+        std_coeff: float = 25.0,
+        cov_coeff: float = 1.0,
+        std_coeff_t: float = 25.0,
+        cov_coeff_t: float = 1.0,
+        std_margin: float = 1.0,
+        std_margin_t: float = 1.0,
+        adjust_cov: bool = True,
+    ):
         super().__init__()
-        self.alpha, self.beta, self.delta = alpha, beta, delta
-        self.gamma, self.eps = gamma, eps
+        self.std_coeff = std_coeff
+        self.cov_coeff = cov_coeff
+        self.std_coeff_t = std_coeff_t
+        self.cov_coeff_t = cov_coeff_t
+        self.std_margin = std_margin
+        self.std_margin_t = std_margin_t
+        self.adjust_cov = adjust_cov
 
-    def _flatten_features(self, Z: torch.Tensor) -> torch.Tensor:
-        # (T,B,C,H,W) -> (T,B,D), or pass-through if already (T,B,D)
-        if Z.dim() == 5:
-            T,B,C,H,W = Z.shape
-            return Z.view(T, B, C*H*W)
-        if Z.dim() == 3:
-            return Z
-        raise ValueError(f"Expected (T,B,C,H,W) or (T,B,D), got {Z.shape}")
+    # ------------------------------------------------------------------
+    def forward(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        z: (B, T, D)
+        """
+        # compute in float32 for stability under bf16 AMP
+        z32 = z.float()
 
-    def _L_sim(self, Zp: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
-        # MSE averaged over T,B,D
-        return F.mse_loss(Zp, Z)
+        B, T, _ = z32.shape
+        # ----- Batch-wise stats (need B >= 2) -----
+        if B >= 2:
+            std_b = self.std_loss(z32.permute(1, 0, 2), across_time=False)
+            cov_b = self.cov_loss(z32.permute(1, 0, 2), across_time=False)
+            std_b_term = self.std_coeff * std_b.mean()
+            cov_b_term = self.cov_coeff * cov_b.mean()
+        else:
+            std_b_term = z32.new_zeros(())
+            cov_b_term = z32.new_zeros(())
 
-    def _L_var_time(self, Z: torch.Tensor) -> torch.Tensor:
-        # Z: (T,B,D). Var over TIME per (b,j) -> (B,D)
-        var_t = Z.var(dim=0, unbiased=False)
-        std_t = torch.sqrt(var_t + self.eps)
-        return F.relu(self.gamma - std_t).mean()
+        # ----- Temporal stats (need T >= 2) -----
+        if T >= 2:
+            std_t = self.std_loss(z32, across_time=True)
+            cov_t = self.cov_loss(z32, across_time=True)
+            std_t_term = self.std_coeff_t * std_t.mean()
+            cov_t_term = self.cov_coeff_t * cov_t.mean()
+        else:
+            std_t_term = z32.new_zeros(())
+            cov_t_term = z32.new_zeros(())
 
-    def _L_cov_batch_per_t(self, Z: torch.Tensor) -> torch.Tensor:
-        # Off-diagonal covariance across B for each time t, averaged over t, normalized by D
-        T,B,D = Z.shape
-        acc = 0.0
-        for t in range(T):
-            zt = Z[t] - Z[t].mean(dim=0)       # (B,D)
-            cov = (zt.T @ zt) / max(1, B-1)    # (D,D)
-            acc += (off_diagonal(cov).pow(2).sum() / D)
-        return acc / T
+        total_loss = std_b_term + cov_b_term + std_t_term + cov_t_term
 
-    def _L_time_smooth(self, Z: torch.Tensor) -> torch.Tensor:
-        # ||Z_{t+1}-Z_t||^2 averaged over (t,b)
-        if Z.size(0) < 2: 
-            return Z.new_tensor(0.0)
-        diffs = Z[1:] - Z[:-1]
-        return diffs.pow(2).mean()
-
-    def forward(self, Z_pred: torch.Tensor, Z_true: torch.Tensor) -> dict:
-        Zp = self._flatten_features(Z_pred)   # (T,B,D)
-        Zt = self._flatten_features(Z_true)   # (T,B,D)
-
-        L_sim  = self._L_sim(Zp, Zt)
-        L_var  = self._L_var_time(Zt)
-        L_cov  = self._L_cov_batch_per_t(Zt)
-        L_tsim = self._L_time_smooth(Zt)
-
-        loss = L_sim + self.alpha*L_var + self.beta*L_cov + self.delta*L_tsim
+        # cast back to original dtype
         return {
-            "loss": loss,
-            "loss_sim": L_sim,
-            "loss_var_time": L_var,
-            "loss_cov_batch_t": L_cov,
-            "loss_time_smooth": L_tsim,
+            "std":   std_b_term.to(z.dtype),
+            "cov":   cov_b_term.to(z.dtype),
+            "std_t": std_t_term.to(z.dtype),
+            "cov_t": cov_t_term.to(z.dtype),
+            "loss":  total_loss.to(z.dtype),
         }
+
+    # ------------------------------------------------------------------
+    def std_loss(self, x: torch.Tensor, across_time: bool = False) -> torch.Tensor:
+        """
+        Compute variance (std) regularization term.
+
+        Args:
+            x: tensor of shape (T, B, D) if across_time=False,
+               or (B, T, D) if across_time=True
+        """
+        x = x - x.mean(dim=1, keepdim=True)  # zero-mean per sample
+        std = torch.sqrt(x.var(dim=1, unbiased=False) + 1e-4)
+
+        margin = self.std_margin_t if across_time else self.std_margin
+        std_loss = torch.mean(F.relu(margin - std), dim=-1)
+        return std_loss
+
+    # ------------------------------------------------------------------
+    def cov_loss(self, x: torch.Tensor, across_time: bool = False) -> torch.Tensor:
+        """
+        Memory-safe covariance penalty.
+        x: (T,B,D) if across_time=False, (B,T,D) if across_time=True
+        Returns shape (1,) (averaged).
+        """
+        # Need at least 2 samples along the sample axis (= dim=1)
+        if x.size(1) < 2:
+            return torch.zeros((1,), device=x.device, dtype=x.dtype)
+
+        # center across the sample axis
+        x = x - x.mean(dim=1, keepdim=True)
+
+        # collapse leading axis to make one big sample set
+        BT = x.shape[0] * x.shape[1]
+        D  = x.shape[-1]
+        x_flat = x.reshape(BT, D)
+
+        n = x_flat.size(0)
+        if n < 2:
+            return torch.zeros((1,), device=x.device, dtype=x.dtype)
+        denom = float(n - 1)
+
+        # chunked over features to avoid (D x D) allocation
+        chunk = 512
+        total = x_flat.new_tensor(0.0)
+        parts = 0
+
+        for start in range(0, D, chunk):
+            end = min(start + chunk, D)
+            c = end - start
+            x_chunk = x_flat[:, start:end]              # (n, c)
+            cov_blk = (x_chunk.T @ x_chunk) / denom     # (c, c)
+            diag = torch.diagonal(cov_blk, dim1=0, dim2=1)
+            offdiag_sq_sum = cov_blk.pow(2).sum() - diag.pow(2).sum()
+
+            block = offdiag_sq_sum / c
+            if self.adjust_cov and c > 1:
+                block = block / (c - 1)
+
+            total = total + block
+            parts += 1
+
+        cov = total / max(parts, 1)
+        return cov.unsqueeze(0)
+

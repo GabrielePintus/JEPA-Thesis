@@ -4,7 +4,7 @@ import torch.nn as nn
 
 
 class ConvPredictor(nn.Module):
-    def __init__(self, in_channels=22, hidden_channels=32, out_channels=20):
+    def __init__(self, in_channels=20, hidden_channels=32, out_channels=18):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
@@ -58,34 +58,6 @@ class JEPAPredictor(nn.Module):
 
 
 
-class InverseDynamics(nn.Module):
-    """
-    Predicts the action vector given two latent states (z_t, z_{t+1}).
-    Operates on concatenated flattened latents.
-    """
-    def __init__(self, z_channels=20, action_dim=2, hidden_dim=128):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(2 * z_channels, hidden_dim, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(4, hidden_dim),
-            nn.ReLU(inplace=True),
 
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(4, hidden_dim),
-            nn.ReLU(inplace=True),
-
-            nn.AdaptiveAvgPool2d(1),   # collapse spatial dimensions
-        )
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, action_dim),
-        )
-
-    def forward(self, z_t, z_next):
-        x = torch.cat([z_t, z_next], dim=1)
-        h = self.conv(x)
-        return self.fc(h)
 
 
