@@ -235,7 +235,7 @@ class JEPA_TeacherStudent(L.LightningModule):
         # ---------------------------
         opt_decoder = torch.optim.AdamW(
             self.decoder.parameters(),
-            lr=self.hparams.initial_lr / 5.0,
+            lr=5e-5,
             weight_decay=0.0,
         )
 

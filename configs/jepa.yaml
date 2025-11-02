@@ -34,7 +34,7 @@ trainer:
 
 model:
   encoder_weights: null
-  initial_lr: 5e-3
+  initial_lr: 5e-4
   final_lr: 1e-6
   warmup_steps: 2000
 
@@ -47,4 +47,4 @@ data:
   num_workers: 2
   pin_memory: true
   val_size: 0.1
-  epoch_fraction: 0.5
+  epoch_fraction: 0.2
