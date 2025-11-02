@@ -1,9 +1,9 @@
 import torch
 from lightning.pytorch.cli import LightningCLI
-from src.jepa import JEPA_TeacherStudent as JEPA
-# from src.jepa import JEPA_Regularized as JEPA
-from src.data.datamodule import PointMazeDataModule
-# from src.data.datamodule import PointMazeSequencesDataModule as PointMazeDataModule
+# from src.jepa import JEPA_TeacherStudent as JEPA
+from src.jepa import JEPA_Regularized as JEPA
+# from src.data.datamodule import PointMazeDataModule
+from src.data.datamodule import PointMazeSequencesDataModule as PointMazeDataModule
 
 SEED = 0
 

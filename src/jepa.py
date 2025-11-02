@@ -128,8 +128,12 @@ class JEPA_TeacherStudent(L.LightningModule):
 
         # Reconstruct
         frame_recon = self.decoder(z_state.detach())
+        next_frame_recon = self.decoder(z_next_state.detach())
         # Compute reconstruction loss
-        loss_reconstruction = self.reconstruction_cost(frame_recon, frame)
+        loss_reconstruction = 0
+        loss_reconstruction += self.reconstruction_cost(frame_recon, frame)
+        loss_reconstruction += self.reconstruction_cost(next_frame_recon, next_frame)
+        loss_reconstruction /= 2.0
 
         return {'loss': loss,
                 'loss_prediction': loss_prediction,
@@ -274,7 +278,7 @@ class JEPA_Regularized(L.LightningModule):
         self.predictor           = ConvPredictor()
 
         # Decoders
-        self.idm                 = InverseDynamicsModel(latent_dim=18*26*26, action_dim=2, hidden_dim=256)
+        self.idm                 = InverseDynamicsModel(action_dim=2, hidden_dim=256)
         self.idm                 = torch.compile(self.idm, mode='default')
         self.visual_decoder      = MeNet6Decoder128()
 
@@ -322,7 +326,7 @@ class JEPA_Regularized(L.LightningModule):
         return z_next_state_pred
         
 
-    def shared_step(self, batch, batch_idx, optimizer_idx=0):
+    def shared_step(self, batch, batch_idx):
         """
         batch = (obs_t, obs_tp, proprio_t, action_t)
         where:
@@ -389,8 +393,8 @@ class JEPA_Regularized(L.LightningModule):
                 'loss_prediction': loss_prediction,
                 'loss_idm': loss_idm,
                 'loss_tvcreg': loss_tvcreg['loss'],
-                'loss_std': loss_tvcreg['std'],
-                'loss_cov': loss_tvcreg['cov'],
+                # 'loss_std': loss_tvcreg['std'],
+                # 'loss_cov': loss_tvcreg['cov'],
                 'loss_std_t': loss_tvcreg['std_t'],
                 'loss_cov_t': loss_tvcreg['cov_t'],
                 'loss_reconstruction': loss_reconstruction
