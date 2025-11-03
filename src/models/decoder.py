@@ -49,20 +49,17 @@ class InverseDynamicsModel(nn.Module):
     Inverse Dynamics Model (IDM):
     Given current and next latent states, predict the action taken.
     """
-    def __init__(self, action_dim=2, hidden_dim=256):
+    def __init__(self, action_dim=2, hidden_dim=64):
         super().__init__()
         self.cnn = nn.Sequential(
-            nn.Conv2d(36, 36, kernel_size=3, stride=1, padding=0),
-            nn.BatchNorm2d(36),
+            nn.Conv2d(36, 64, kernel_size=5, stride=1, padding=2),  # 26x26 -> 26x26
+            nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.Conv2d(36, 36, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(36),
-            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=0),  # 13x13 -> 11x11
+            nn.AdaptiveAvgPool2d((1, 1)),
         )
         self.fcnn = nn.Sequential(
-            nn.Linear(5184, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(128, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, action_dim),
         )
@@ -115,26 +112,12 @@ class FlashAttentionBlock(nn.Module):
 
 
 class InverseDynamicsTransformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, out_dim=1):
-        """
-        Transformer predictor with a [CLS] token and a final FC head.
-
-        Args:
-            dim: embedding dimension
-            depth: number of transformer layers
-            heads: number of attention heads
-            dim_head: per-head dimension
-            mlp_dim: hidden dimension in feed-forward layers
-            out_dim: output dimension of the FC head
-        """
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, out_dim=2):
         super().__init__()
         self.dim = dim
-
-        # --- CLS token ---
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.temporal_embed = nn.Parameter(torch.randn(1, 2, dim))  # embeddings for (t, t+1)
 
-        # --- Transformer layers (FlashAttention blocks) ---
-        self.norm = nn.LayerNorm(dim)
         self.layers = nn.ModuleList([
             nn.ModuleList([
                 FlashAttentionBlock(dim, heads=heads, dim_head=dim_head),
@@ -148,36 +131,36 @@ class InverseDynamicsTransformer(nn.Module):
             for _ in range(depth)
         ])
 
-        # --- Output head ---
         self.fc_head = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, out_dim)
         )
 
-        # Optional: init CLS token
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
-    def forward(self, x):
+    def forward(self, z_t, z_tp1):
         """
-        x: (B, N, D)
-        returns:
-            cls_out: (B, out_dim)
-            all_tokens: (B, N+1, D)
+        z_t, z_tp1: (B, N, D)
+        returns: predicted action (B, out_dim)
         """
-        b, n, _ = x.shape
+        b, n, d = z_t.shape
 
-        # prepend cls token
-        cls_tokens = self.cls_token.expand(b, -1, -1)   # (B, 1, D)
-        x = torch.cat((cls_tokens, x), dim=1)           # (B, N+1, D)
+        # Concatenate states and add temporal embeddings
+        z_t = z_t + self.temporal_embed[:, 0].unsqueeze(1)
+        z_tp1 = z_tp1 + self.temporal_embed[:, 1].unsqueeze(1)
+        x = torch.cat([z_t, z_tp1], dim=1)
 
-        # pass through transformer
+        # prepend CLS
+        cls_tokens = self.cls_token.expand(b, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+
+        # transformer layers
         for attn, ff in self.layers:
             x = x + attn(x)
             x = x + ff(x)
 
-        x = self.norm(x)
-        cls_out = x[:, 0]                               # (B, D)
-        return self.fc_head(cls_out)
+        x = x[:, 0]  # CLS
+        return self.fc_head(x)
 
 
 class VisualDecoderV2(nn.Module):
@@ -257,4 +240,86 @@ class VisualDecoderV2(nn.Module):
 
         # --- Optional convolutional refinement ---
         img = self.refine(img)
+        return img
+    
+
+
+class VisualDecoderSimple(nn.Module):
+    """
+    Simple symmetric decoder that reconstructs (B, 3, 64, 64)
+    from ViT patch tokens (B, N, D), where N = (H/ps)*(W/ps).
+
+    Example:
+        image_size=64, patch_size=8  →  N = 64
+        Input:  (B, 64, D)
+        Output: (B, 3, 64, 64)
+    """
+
+    def __init__(self, image_size=64, patch_size=8, dim=32, out_channels=3):
+        super().__init__()
+        assert image_size % patch_size == 0, "image_size must be divisible by patch_size"
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.dim = dim
+        self.out_channels = out_channels
+
+        # Spatial shape of patch grid
+        self.nh = image_size // patch_size
+        self.nw = image_size // patch_size
+
+        # --- Map tokens to base feature map ---
+        self.token_proj = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, 64),  # expand token embedding to feature channels
+        )
+
+        # --- Upsampling path: (8→16→32→64) ---
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1),  # 8→16
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # 16→32
+            nn.GroupNorm(4, 32),
+            nn.GELU(),
+
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),  # 32→64
+            nn.GroupNorm(4, 16),
+            nn.GELU(),
+
+            nn.Conv2d(16, out_channels, kernel_size=3, padding=1),
+            nn.Sigmoid(),  # assumes target in [0,1]
+        )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, tokens):
+        """
+        Args:
+            tokens: (B, N, D) patch tokens
+        Returns:
+            img: (B, 3, 64, 64)
+        """
+        B, N, D = tokens.shape
+        assert N == self.nh * self.nw or N == self.nh * self.nw + 1, (
+            f"Expected {self.nh*self.nw} tokens (+CLS), got {N}"
+        )
+
+        # Drop CLS if present
+        if N == self.nh * self.nw + 1:
+            tokens = tokens[:, 1:, :]
+
+        # Map each token → local feature
+        x = self.token_proj(tokens)               # (B, N, 64)
+        x = x.view(B, self.nh, self.nw, 64)       # (B, nh, nw, 64)
+        x = x.permute(0, 3, 1, 2).contiguous()    # (B, 64, nh, nw) e.g. (B, 64, 8, 8)
+
+        # Decode up to full resolution
+        img = self.decoder(x)
         return img

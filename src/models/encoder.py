@@ -44,6 +44,23 @@ class Expander2D(nn.Module):
         x = x.view(B, -1)
         out = x.view(B, self.out_channels, 1, 1)
         out = out.expand(-1, -1, *self.target_shape)
+
+        return out
+
+
+
+class Expander1D(nn.Module):
+    """Expands a low-dimensional proprioceptive vector into a higher-dimensional vector."""
+    def __init__(self, out_dim=32):
+        super().__init__()
+        self.out_dim = out_dim
+
+    def forward(self, x):
+        # Repeat along feature dimension
+        B = x.shape[0]
+        x = x.view(B, -1)
+        out = x.unsqueeze(2).expand(-1, -1, self.out_dim // x.shape[1])
+        out = out.contiguous().view(B, self.out_dim)
         return out
 
 
@@ -295,7 +312,6 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                # Attention(dim, heads=heads, dim_head=dim_head),
                 FlashAttention(dim, heads=heads, dim_head=dim_head),
                 FeedForward(dim, mlp_dim),
             ]))
