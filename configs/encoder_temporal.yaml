@@ -3,7 +3,7 @@ trainer:
   accelerator: gpu
   devices: 1
   num_nodes: 1
-  strategy: ddp_find_unused_parameters_false
+  strategy: ddp
   precision: bf16-mixed
   # gradient clipping
   gradient_clip_val: 2.0
@@ -38,7 +38,7 @@ trainer:
 #   proj_dim: 256
 model:
   emb_dim: 32
-  depth: 4
+  depth: 3
   heads: 4
   mlp_dim: 64
   proj_dim: 128

@@ -16,11 +16,9 @@ class ProprioDecoder(nn.Module):
         self.net = nn.Sequential(
             nn.LayerNorm(emb_dim),
             nn.Linear(emb_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
+            nn.ReLU(),
             nn.Linear(hidden_dim, state_dim),
         )
     

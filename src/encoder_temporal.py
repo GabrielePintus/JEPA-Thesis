@@ -62,17 +62,17 @@ class VICRegJEPAEncoder(L.LightningModule):
             emb_dim=emb_dim,
             patch_size=8,
         )
-        self.proprio_decoder = ProprioDecoder(emb_dim=emb_dim)
+        self.proprio_decoder = ProprioDecoder(emb_dim=emb_dim, hidden_dim=64)
         self.idm_visual = nn.Sequential(
             nn.LayerNorm(emb_dim * 2),
             nn.Linear(emb_dim * 2, emb_dim),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(emb_dim, emb_dim),
         )
         self.idm_proprio = nn.Sequential(
             nn.LayerNorm(emb_dim * 2),
             nn.Linear(emb_dim * 2, emb_dim),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(emb_dim, emb_dim),
         )
         self.state_from_patches_decoder = RegressionTransformerDecoder(
@@ -171,8 +171,9 @@ class VICRegJEPAEncoder(L.LightningModule):
         # Visual reconstruction probe
         frame_curr_recon = self.visual_decoder(patch_curr.detach())  # (B,3,64,64)
         frame_next_recon = self.visual_decoder(patch_next.detach())  # (B,3,64,64)
-        visual_recon_loss_curr = self.focal_loss(frame_curr_recon, frame_curr) + F.mse_loss(frame_curr_recon, frame_curr)
-        visual_recon_loss_next = self.focal_loss(frame_next_recon, frame_next) + F.mse_loss(frame_next_recon, frame_next)
+        alpha = 0.9
+        visual_recon_loss_curr = alpha * self.focal_loss(frame_curr_recon, frame_curr) + (1 - alpha) * F.mse_loss(frame_curr_recon, frame_curr)
+        visual_recon_loss_next = alpha * self.focal_loss(frame_next_recon, frame_next) + (1 - alpha) * F.mse_loss(frame_next_recon, frame_next)
         visual_recon_loss = (visual_recon_loss_curr + visual_recon_loss_next) / 2.0
 
 
