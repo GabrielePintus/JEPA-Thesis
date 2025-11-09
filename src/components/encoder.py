@@ -106,28 +106,6 @@ class PatchEmbed(nn.Module):
         return tokens, (H, W)
 
 
-class PositionalEncoding2D(nn.Module):
-    """
-    Learnable positional embeddings for patches + CLS.
-    Works with varying grid sizes (depends on patch_size).
-    """
-    def __init__(self, emb_dim, grid_hw, add_cls=True):
-        super().__init__()
-        H, W = grid_hw
-        self.add_cls = add_cls
-        self.pos = nn.Parameter(torch.randn(1, H * W, emb_dim))
-        self.cls_pos = nn.Parameter(torch.randn(1, 1, emb_dim)) if add_cls else None
-
-    def forward(self, patches, cls_token=None):
-        patches = patches + self.pos
-        if self.add_cls and cls_token is not None:
-            cls_token = cls_token + self.cls_pos
-            patches = torch.cat([cls_token, patches], dim=1)
-        return patches
-
-
-
-
 
 class SinusoidalPositionalEncoding2D(nn.Module):
     """
@@ -299,7 +277,7 @@ class VisualEncoder(nn.Module):
         x_all = self.pos(tokens, cls)
         x_all = self.tr(x_all)
 
-        return x_all[:, 0], x_all[:, 1:], grid_hw
+        return x_all[:, 0], x_all[:, 1:], (grid_hw, feat)
 
 
 # ===========================

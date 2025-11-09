@@ -2,14 +2,20 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import transforms
 import lightning as L
 from torch.optim.lr_scheduler import LambdaLR
 from vicreg_loss import VICRegLoss
 # from src.vicreg import VICRegLoss
+from src.focal_loss import FocalReconstructionLoss
 
 from src.components.encoder import VisualEncoder, ProprioEncoder, MLPProjection, LocalizationHead
-from src.components.decoder import VisualDecoder, ProprioDecoder
+from src.components.decoder import VisualDecoder, ProprioDecoder, RegressionTransformerDecoder
 
+
+def focal_mse(pred, target, gamma=2):
+    err = (pred - target)
+    return ((err.abs() ** gamma) * (err ** 2))
 
 class VICRegJEPAEncoder(L.LightningModule):
     """
@@ -69,19 +75,20 @@ class VICRegJEPAEncoder(L.LightningModule):
             nn.GELU(),
             nn.Linear(emb_dim, emb_dim),
         )
+        self.state_from_patches_decoder = RegressionTransformerDecoder(
+            d_model=emb_dim,
+            d_out=emb_dim,
+            num_layers=1,
+            nhead=2,
+            dim_feedforward=64,
+            num_queries=1,
+        )
 
         # Projections for VICReg
         self.proj_cls       = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
         self.proj_patch     = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)  # applied per token
         self.proj_cross_vis = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)  # CLS→proj
         self.proj_cross_pos = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)  # PosToken→proj
-
-        # Localization head(s) for supervised tasks
-        # self.loc_head = LocalizationHead(dim=emb_dim, grid_hw=(8, 8))
-        # self.obs_head = nn.Sequential(
-        #     nn.LayerNorm(emb_dim),
-        #     nn.Linear(emb_dim, 4)   # predict (x,y,vx,vy)
-        # )
 
         # Compile all the networks
         if compile:
@@ -96,19 +103,17 @@ class VICRegJEPAEncoder(L.LightningModule):
             self.proprio_decoder    = torch.compile(self.proprio_decoder)
             self.idm_visual        = torch.compile(self.idm_visual)
             self.idm_proprio       = torch.compile(self.idm_proprio)
+            self.state_from_patches_decoder = torch.compile(self.state_from_patches_decoder)
 
         # Losses
-        self.vicreg_loss = VICRegLoss(inv_coeff=1.0, var_coeff=25.0, cov_coeff=1.0, gamma=1.0)
+        self.vicreg_loss = VICRegLoss()
+        self.focal_loss = FocalReconstructionLoss(gamma=2.0, alpha=0.5)
 
         self._decoder_delay_steps = decoder_delay_steps
         self._global_step = 0
 
     def shared_step(self, batch, batch_idx):
         (state_curr, frame_curr), action, (state_next, frame_next), _ = batch
-
-
-        # extract only (x,y) for losses that depend on predictability
-        # pos_px = obs[:, :2]        # (B, 2)
 
         # 1) Encode both views (vision branch)
         cls_curr, patch_curr, _ = self.visual_encoder(frame_curr)      # (B, D), (B, N, D)
@@ -134,9 +139,23 @@ class VICRegJEPAEncoder(L.LightningModule):
         # Temporal VICReg loss on state tokens
         z_state_curr_proj = self.proj_cross_pos(z_state_curr)
         z_state_next_proj = self.proj_cross_pos(z_state_next)
-        vcreg_state_1 = 15 * VICRegLoss.variance_loss(z_state_curr_proj, 1.0) + VICRegLoss.covariance_loss(z_state_curr_proj)
-        vcreg_state_2 = 15 * VICRegLoss.variance_loss(z_state_next_proj, 1.0) + VICRegLoss.covariance_loss(z_state_next_proj)
-        vcreg_state = (vcreg_state_1 + vcreg_state_2) / 2.0
+        vcreg_state_curr = 15 * VICRegLoss.variance_loss(z_state_curr_proj, 1.0) + VICRegLoss.covariance_loss(z_state_curr_proj)
+        vcreg_state_next = 15 * VICRegLoss.variance_loss(z_state_next_proj, 1.0) + VICRegLoss.covariance_loss(z_state_next_proj)
+        vcreg_state = (vcreg_state_curr + vcreg_state_next) / 2.0
+
+        # Invariance between state and visual CLS tokens
+        z_cross_vis_curr = self.proj_cross_vis(cls_curr)
+        z_cross_vis_next = self.proj_cross_vis(cls_next)
+        vicreg_cross_curr = F.mse_loss(z_cross_vis_curr, z_state_curr_proj)
+        vicreg_cross_next = F.mse_loss(z_cross_vis_next, z_state_next_proj)
+        vicreg_cross = (vicreg_cross_curr + vicreg_cross_next) / 2.0
+
+        # Decode z_state_curr, z_state_next from visual patches
+        state_from_patches_curr = self.state_from_patches_decoder(patch_curr).squeeze(1)  # (B, D)
+        state_from_patches_next = self.state_from_patches_decoder(patch_next).squeeze(1)  # (B, D)
+        state_from_patches_loss_curr = F.mse_loss(state_from_patches_curr, z_state_curr)
+        state_from_patches_loss_next = F.mse_loss(state_from_patches_next, z_state_next)
+        state_from_patches_loss = (state_from_patches_loss_curr + state_from_patches_loss_next) / 2.0
 
         # Decode action from visual cls, proprio state and visual patches
         idm_input_visual = torch.cat([cls_curr, cls_next], dim=-1)
@@ -149,45 +168,64 @@ class VICRegJEPAEncoder(L.LightningModule):
         idm_loss = (idm_visual_loss + idm_proprio_loss) / 2.0
 
 
+        # Visual reconstruction probe
+        frame_curr_recon = self.visual_decoder(patch_curr.detach())  # (B,3,64,64)
+        frame_next_recon = self.visual_decoder(patch_next.detach())  # (B,3,64,64)
+        visual_recon_loss_curr = self.focal_loss(frame_curr_recon, frame_curr) + F.mse_loss(frame_curr_recon, frame_curr)
+        visual_recon_loss_next = self.focal_loss(frame_next_recon, frame_next) + F.mse_loss(frame_next_recon, frame_next)
+        visual_recon_loss = (visual_recon_loss_curr + visual_recon_loss_next) / 2.0
+
+
+        # Proprio reconstruction probe — only supervise (x,y)
+        state_curr_recon = self.proprio_decoder(z_state_curr.detach())   # (B,4)
+        state_next_recon = self.proprio_decoder(z_state_next.detach())   # (B,4)
+        proprio_recon_loss_curr = F.mse_loss(state_curr_recon, state_curr)
+        proprio_recon_loss_next = F.mse_loss(state_next_recon, state_next)
+        proprio_recon_loss = (proprio_recon_loss_curr + proprio_recon_loss_next) / 2.0
         
-
-        if self._global_step >= self._decoder_delay_steps:
-            # Visual reconstruction probe
-            frame_curr_recon = self.visual_decoder(patch_curr.detach())  # (B,3,64,64)
-            frame_next_recon = self.visual_decoder(patch_next.detach())  # (B,3,64,64)
-            visual_recon_loss = (F.mse_loss(frame_curr_recon, frame_curr) + F.mse_loss(frame_next_recon, frame_next)) / 2.0
-
-            # Proprio reconstruction probe — only supervise (x,y)
-            state_curr_recon = self.proprio_decoder(z_state_curr.detach())   # (B,4)
-            state_next_recon = self.proprio_decoder(z_state_next.detach())   # (B,4)
-            proprio_recon_loss = (F.mse_loss(state_curr_recon, state_curr) + F.mse_loss(state_next_recon, state_next)) / 2.0
-
-        else:
-            visual_recon_loss = torch.tensor(0.0, device=self.device)
-            proprio_recon_loss = torch.tensor(0.0, device=self.device)
-        recon_loss = visual_recon_loss + proprio_recon_loss
+        recon_loss_curr = visual_recon_loss_curr + proprio_recon_loss_curr
+        recon_loss_next = visual_recon_loss_next + proprio_recon_loss_next
+        recon_loss = (recon_loss_curr + recon_loss_next) / 2.0
 
         # Total loss
         loss = (
             recon_loss +
-            proprio_recon_loss +
             idm_loss +
             self.hparams.vc_global_coeff * vcreg_cls +
             self.hparams.vc_patch_coeff  * vcreg_patch +
-            self.hparams.vic_state_coeff  * vcreg_state
+            self.hparams.vic_state_coeff  * vcreg_state +
+            vicreg_cross + state_from_patches_loss
         )
 
         return {
             "loss": loss,
             "recon_loss": recon_loss,
+            "recon_loss_curr": recon_loss_curr,
+            "recon_loss_next": recon_loss_next,
             "proprio_recon_loss": proprio_recon_loss,
+            "proprio_recon_loss_curr": proprio_recon_loss_curr,
+            "proprio_recon_loss_next": proprio_recon_loss_next,
             "visual_recon_loss": visual_recon_loss,
+            "visual_recon_loss_curr": visual_recon_loss_curr,
+            "visual_recon_loss_next": visual_recon_loss_next,
             "idm_loss": idm_loss,       
             "idm_visual_loss": idm_visual_loss,
             "idm_proprio_loss": idm_proprio_loss,
             "vcreg_cls": vcreg_cls,
+            "vcreg_cls_curr": vcreg_cls_curr,
+            "vcreg_cls_next": vcreg_cls_next,
             "vcreg_patch": vcreg_patch,
-            "vcreg_state": vcreg_state,   
+            "vcreg_patch_curr": vcreg_patch_curr,
+            "vcreg_patch_next": vcreg_patch_next,
+            "vcreg_state": vcreg_state,
+            "vcreg_state_curr": vcreg_state_curr,
+            "vcreg_state_next": vcreg_state_next,
+            "vicreg_cross": vicreg_cross,
+            "vicreg_cross_curr": vicreg_cross_curr,
+            "vicreg_cross_next": vicreg_cross_next,
+            "state_from_patches_loss": state_from_patches_loss,
+            "state_from_patches_loss_curr": state_from_patches_loss_curr,
+            "state_from_patches_loss_next": state_from_patches_loss_next,
         }
 
     def training_step(self, batch, batch_idx):
@@ -218,7 +256,8 @@ class VICRegJEPAEncoder(L.LightningModule):
 
         decoder_params = {
             "params": list(self.visual_decoder.parameters())
-                    + list(self.proprio_decoder.parameters()),
+                    + list(self.proprio_decoder.parameters())
+                    + list(self.state_from_patches_decoder.parameters()),
             "lr": self.hparams.initial_lr_decoder,    # <-- smaller LR for decoder
             "weight_decay": 0.0,                    # <-- common choice: no WD on decoder
         }

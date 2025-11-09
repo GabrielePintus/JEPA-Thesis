@@ -3,7 +3,7 @@ trainer:
   accelerator: gpu
   devices: 1
   num_nodes: 1
-  strategy: ddp_find_unused_parameters_true
+  strategy: ddp_find_unused_parameters_false
   precision: bf16-mixed
   # gradient clipping
   gradient_clip_val: 2.0
@@ -22,26 +22,32 @@ trainer:
       auto_insert_metric_name: false       # keep filename clean
       every_n_epochs: 1
       save_on_train_epoch_end: true
-  # logger:
-  #   class_path: lightning.pytorch.loggers.WandbLogger
-  #   init_args:
-  #     project: "JEPA"
-  #     name: "PointMaze/TemporalEncoder"
-  #     log_model: true
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: "JEPA"
+      name: "PointMaze/TemporalEncoder"
+      log_model: true
 
 
+# model:
+#   emb_dim: 64
+#   depth: 4
+#   heads: 4
+#   mlp_dim: 256
+#   proj_dim: 256
 model:
   emb_dim: 32
-  depth: 3
+  depth: 4
   heads: 4
-  mlp_dim: 128
-  proj_dim: 256
-  initial_lr_encoder: 1e-3
+  mlp_dim: 64
+  proj_dim: 128
+  initial_lr_encoder: 3e-3
   final_lr_encoder: 1e-5
   weight_decay_encoder: 1e-3
-  initial_lr_decoder: 1e-4
-  final_lr_decoder: 1e-6
-  weight_decay_decoder: 1e-5
+  initial_lr_decoder: 3e-3
+  final_lr_decoder: 5e-6
+  weight_decay_decoder: 0
   initial_lr_idm: 1e-3
   final_lr_idm: 1e-5
   weight_decay_idm: 1e-5
