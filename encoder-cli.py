@@ -1,8 +1,7 @@
 import torch
 from lightning.pytorch.cli import LightningCLI
-from src.encoder_temporal import VICRegJEPAEncoder
-# from src.data.datamodule import PointMazeVICRegDataModule
-from src.data.datamodule import PointMazeDataModule as DataModule
+from src.encoder_seq import VICRegJEPAEncoder
+from src.data.datamodule import PointMazeSequencesDataModule
 
 SEED = 0
 
@@ -14,7 +13,7 @@ if __name__ == "__main__":
     # Lightning CLI
     LightningCLI(
         model_class=VICRegJEPAEncoder,
-        datamodule_class=DataModule,
+        datamodule_class=PointMazeSequencesDataModule,
         seed_everything_default=SEED,
         save_config_kwargs={"overwrite": True},
     )

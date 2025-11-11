@@ -102,8 +102,32 @@ class PatchEmbed(nn.Module):
     def forward(self, feat):     # feat: (B, 64, 64, 64)
         x = self.proj(feat)      # (B, D, H, W)
         B, D, H, W = x.shape
-        tokens = x.flatten(2).transpose(1, 2)  # (B, H*W, D)
+        tokens = x.flatten(2).transpose(1, 2)  # (B, H*W, D)    
+        tokens = F.layer_norm(tokens, (tokens.shape[-1],))  # LN over embedding dim, it helps significantly
         return tokens, (H, W)
+    
+# class PatchEmbed(nn.Module):
+#     def __init__(self, in_ch, patch_size, emb_dim):
+#         super().__init__()
+#         self.patch_size = patch_size
+
+#         self.proj = nn.Conv2d(
+#             in_ch,
+#             emb_dim,
+#             kernel_size=patch_size,
+#             stride=patch_size // 2,   # <-- HALF stride
+#             padding=patch_size // 2 - 1
+#         )
+#         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+#     def forward(self, feat):     # feat: (B, C, 64, 64)
+#         x = self.proj(feat)      # (B, D, H*2, W*2) because stride is halved
+#         x = self.pool(x)         # (B, D, H, W) back to original token count
+
+#         B, D, H, W = x.shape
+#         tokens = x.flatten(2).transpose(1, 2)  # (B, H*W, D)
+#         tokens = F.layer_norm(tokens, (D,))
+#         return tokens, (H, W)
 
 
 
@@ -299,42 +323,37 @@ class ProprioEncoder(nn.Module):
 class MLPProjection(nn.Module):
     def __init__(self, in_dim, proj_dim=1024):
         super().__init__()
-        self.net = nn.Sequential(
-            # nn.BatchNorm1d(in_dim),
-            nn.Linear(in_dim, proj_dim),
-            # nn.GELU(),
-            # nn.Linear(proj_dim, proj_dim),
-            # nn.LayerNorm(proj_dim),
-        )
+        self.net = nn.Linear(in_dim, proj_dim)
 
     def forward(self, x):  # (..., in_dim)
-        orig_shape = x.shape
-        x = x.reshape(-1, orig_shape[-1])  # safe for non-contiguous tensors
+        # flatten everything except the last dim
+        orig_shape = x.shape  # (B, D) or (B, N, D) or (B, T, N, D)
+        x = x.reshape(-1, orig_shape[-1])
         y = self.net(x)
-        return y.reshape(*orig_shape[:-1], -1)
+        return y.reshape(*orig_shape[:-1], -1)  # restore any shape
 
 
 
-class LocalizationHead(nn.Module):
-    """
-    Predicts heatmap over 8x8 patches from patch tokens.
-    Input:  (B, N=64, D)
-    Output: (B, 64) logits
-    """
-    def __init__(self, dim=128, grid_hw=(8, 8)):
-        super().__init__()
-        H, W = grid_hw
-        self.H, self.W = H, W
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim // 2),
-            nn.GELU(),
-            nn.Linear(dim // 2, 1)
-        )
+# class LocalizationHead(nn.Module):
+#     """
+#     Predicts heatmap over 8x8 patches from patch tokens.
+#     Input:  (B, N=64, D)
+#     Output: (B, 64) logits
+#     """
+#     def __init__(self, dim=128, grid_hw=(8, 8)):
+#         super().__init__()
+#         H, W = grid_hw
+#         self.H, self.W = H, W
+#         self.net = nn.Sequential(
+#             nn.LayerNorm(dim),
+#             nn.Linear(dim, dim // 2),
+#             nn.GELU(),
+#             nn.Linear(dim // 2, 1)
+#         )
 
-    def forward(self, patch_tokens):  # (B, 64, D)
-        logits = self.net(patch_tokens).squeeze(-1)  # (B, 64)
-        return logits
+#     def forward(self, patch_tokens):  # (B, 64, D)
+#         logits = self.net(patch_tokens).squeeze(-1)  # (B, 64)
+#         return logits
 
 
 

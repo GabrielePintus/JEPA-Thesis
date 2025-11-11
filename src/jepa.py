@@ -1,1076 +1,307 @@
+import math
 import torch
 import torch.nn as nn
-import lightning as L
 import torch.nn.functional as F
+from torchvision import transforms
+import lightning as L
 from torch.optim.lr_scheduler import LambdaLR
-import math
-from copy import deepcopy
+from vicreg_loss import VICRegLoss
+# from src.vicreg import VICRegLoss
+from src.focal_loss import FocalReconstructionLoss
 
-from src.models.encoder import Expander1D, MeNet6, Expander2D, SimpleViT
-from src.models.predictor import ConvPredictor, TransformerPredictor
-from src.models.decoder import MeNet6Decoder128, InverseDynamicsModel, InverseDynamicsTransformer, VisualDecoderSimple, VisualDecoderV2
-from src.losses import TemporalVICRegLoss
-
+from src.components.encoder import VisualEncoder, ProprioEncoder, MLPProjection
+from src.components.decoder import VisualDecoder, ProprioDecoder, RegressionTransformerDecoder
 
 
+def focal_mse(pred, target, gamma=2):
+    err = (pred - target)
+    return ((err.abs() ** gamma) * (err ** 2))
 
-
-class JEPA_TeacherStudent(L.LightningModule):
+class JEPA(L.LightningModule):
+    """
+    Batch format expectation:
+      batch = {
+        "image": (B, 3, 64, 64) float in [0,1],
+        "pos":   (B, 2) pixel coords [0..63],  # only (x,y) for cross-modal
+        # optionally "vel": (B, 2) but UNUSED here
+      }
+    """
     def __init__(
         self,
-        encoder_weights : str =None,
-        encoder_momentum=0.999,
-        initial_lr=1e-4,
-        final_lr=1e-6,
-        weight_decay=1e-4,
-        warmup_steps=1000,
-        target_shape=(26, 26)
+        emb_dim=128,
+        depth=3,
+        heads=4,
+        mlp_dim=256,
+        proj_dim=1024,
+        initial_lr_encoder = 1e-3,
+        final_lr_encoder   = 1e-5,
+        weight_decay_encoder = 1e-3,
+        initial_lr_decoder = 1e-4,
+        final_lr_decoder   = 1e-6,
+        weight_decay_decoder = 1e-5,
+        initial_lr_idm = 1e-3,
+        final_lr_idm   = 1e-5,
+        weight_decay_idm = 1e-5,
+        warmup_steps = 1000,
+        vc_global_coeff = 1.0,
+        vc_patch_coeff  = 0.5,
+        vic_state_coeff  = 0.2,
+        decoder_delay_steps = 0,
+        compile = False,
     ):
         super().__init__()
-        self.automatic_optimization = False
         self.save_hyperparameters()
 
-        # Encoder
-        self.encoder_student = MeNet6()
-        self.encoder_teacher = MeNet6()
-        self.action_encoder = Expander2D(target_shape=target_shape, out_channels=2)
-        self.proprio_encoder = Expander2D(target_shape=target_shape, out_channels=2)
-        self.decoder = MeNet6Decoder128()
-
-        # Predictor
-        self.predictor = ConvPredictor()
-
-        # Inverse Dynamic Modelling
-        self.idm = InverseDynamicsModel(
-            hidden_dim=64
-        )
-
-        # If the encoder weights are provided, load them
-        if encoder_weights is not None:
-            encoder_weights = torch.load(encoder_weights)
-            self.encoder_student.load_state_dict(encoder_weights)
-            self.encoder_teacher.load_state_dict(encoder_weights)
-        # Freeze student encoder parameters
-        for param in self.encoder_student.parameters():
-            param.requires_grad = False
-        self.encoder_student.eval()
-
-        # Losses
-        self.prediction_cost        = nn.MSELoss()
-        self.idm_cost               = nn.MSELoss()
-        self.reconstruction_cost    = nn.MSELoss()
-
-
-    def encode(
-        self,
-        state,
-        frame,
-        action,
-        next_state,
-        next_frame
-    ):
-        """Encodes state, action, and next_state into latent representations."""
-        z_state         = self.proprio_encoder(state[:, 2:])
-        z_frame         = self.encoder_teacher(frame)
-        z_action        = self.action_encoder(action)
-        with torch.no_grad():
-            z_next_state    = self.proprio_encoder(next_state[:, 2:])
-            z_next_frame    = self.encoder_student(next_frame)
-        z_state = torch.cat([z_state, z_frame], dim=1)
-        z_next_state = torch.cat([z_next_state, z_next_frame], dim=1)
-
-        return z_state, z_action, z_next_state
-
-    def forward(self, obs, proprio=None):
-        """Encodes an observation (and optional proprio) into a latent representation."""
-        z_obs = self.encoder(obs)
-        if proprio is not None:
-            z_prop = self.proprio_encoder(proprio)
-            z = torch.cat([z_obs, z_prop], dim=1)
-        else:
-            z = z_obs
-        return z
-
-    def predict_next(self, z_state, z_action):
-        """Predicts the next latent state given context latent and action."""
-        z = torch.cat([z_state, z_action], dim=1)
-        z_next_state_pred = self.predictor(z) + z_state
-        return z_next_state_pred
-        
-
-    def shared_step(self, batch, batch_idx):
-        """
-        batch = (obs_t, obs_tp, proprio_t, action_t)
-        where:
-          obs_t     : context frame
-          obs_tp    : target future frame
-          proprio_t : optional proprio features
-          action_t  : optional actions
-        """
-        (state, frame), action, (next_state, next_frame) = batch
-
-        # Encode
-        z_state, z_action, z_next_state = self.encode(state, frame, action, next_state, next_frame)
-
-        # Predict
-        z_next_state_pred = self.predict_next(z_state, z_action)
-        action_pred = self.idm(z_state, z_next_state)
-
-        # Compute loss - Stopgrad on z_next_state
-        loss_prediction_visual  = self.prediction_cost(
-            z_next_state_pred[:, 4:, :, :],
-            z_next_state[:, 4:, :, :]
-        )
-        loss_prediction_proprio = self.prediction_cost(
-            z_next_state_pred[:, :4, :, :],
-            z_next_state[:, :4, :, :]
-        )
-        loss_prediction = loss_prediction_visual + loss_prediction_proprio
-        loss_anti_collapse = F.relu(1 - F.l1_loss(z_state, z_next_state.detach()))
-        loss_idm = self.idm_cost(action_pred, action)
-        loss = loss_prediction + loss_idm * 0.1 + loss_anti_collapse * 0.1
-
-        # Reconstruct
-        frame_recon = self.decoder(z_state.detach())
-        next_frame_recon = self.decoder(z_next_state.detach())
-        # Compute reconstruction loss
-        loss_reconstruction = 0
-        loss_reconstruction += self.reconstruction_cost(frame_recon, frame)
-        loss_reconstruction += self.reconstruction_cost(next_frame_recon, next_frame)
-        loss_reconstruction /= 2.0
-
-        return {'loss': loss,
-                'loss_prediction': loss_prediction,
-                'loss_prediction_visual': loss_prediction_visual,
-                'loss_prediction_proprio': loss_prediction_proprio,
-                'loss_idm': loss_idm,
-                'loss_reconstruction': loss_reconstruction,
-                'loss_anti_collapse': loss_anti_collapse,
-                }
-    
-    def training_step(self, batch, batch_idx):
-        # Get optimizers and schedulers
-        opt_jepa, opt_decoder = self.optimizers()
-        lr_sched_jepa = self.lr_schedulers()
-
-
-        loss = self.shared_step(batch, batch_idx)
-
-        self.log_dict({ f'train/{k}': v for k, v in loss.items() }, prog_bar=True, sync_dist=True)
-
-        loss_jepa = loss['loss']
-        self.manual_backward(loss_jepa)
-        torch.nn.utils.clip_grad_norm_(
-            list(self.encoder_teacher.parameters())
-            + list(self.predictor.parameters())
-            + list(self.idm.parameters())
-            + list(self.proprio_encoder.parameters())
-            + list(self.action_encoder.parameters()),
-            max_norm=1.0
-        )
-        opt_jepa.step()
-        opt_jepa.zero_grad()
-        lr_sched_jepa.step()
-
-        with torch.no_grad():
-            for student_param, teacher_param in zip(
-                self.encoder_student.parameters(),
-                self.encoder_teacher.parameters()
-            ):
-                student_param.data.mul_(self.hparams.encoder_momentum)
-                student_param.data.add_(
-                    (1 - self.hparams.encoder_momentum) * teacher_param.data
-                )
-
-        loss_decoder = loss['loss_reconstruction']
-        self.manual_backward(loss_decoder)
-        torch.nn.utils.clip_grad_norm_(
-            self.decoder.parameters(),
-            max_norm=1.0
-        )
-        opt_decoder.step()
-        opt_decoder.zero_grad()
-
-        return loss['loss']
-    
-    def validation_step(self, batch, batch_idx):
-        loss = self.shared_step(batch, batch_idx)
-        self.log_dict({ f'val/{k}': v for k, v in loss.items() }, prog_bar=True, sync_dist=True)
-        return loss['loss']
-
-    def configure_optimizers(self):
-        # ---------------------------
-        # 1️⃣ JEPA Optimizer (main)
-        # ---------------------------
-        opt_jepa = torch.optim.AdamW(
-            list(self.encoder_teacher.parameters())
-            + list(self.predictor.parameters())
-            + list(self.idm.parameters())
-            + list(self.proprio_encoder.parameters())
-            + list(self.action_encoder.parameters()),
-            lr=self.hparams.initial_lr,
-            weight_decay=self.hparams.weight_decay
-        )
-
-        def lr_lambda(step: int):
-            if self.trainer is None or not hasattr(self.trainer, "estimated_stepping_batches"):
-                max_steps = 100_000  # fallback
-            else:
-                max_steps = self.trainer.estimated_stepping_batches
-
-            # Linear warmup
-            if step < self.hparams.warmup_steps:
-                return step / float(self.hparams.warmup_steps)
-
-            # Cosine decay
-            progress = (step - self.hparams.warmup_steps) / float(
-                max(1, max_steps - self.hparams.warmup_steps)
-            )
-            cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-            decayed = (
-                self.hparams.final_lr / self.hparams.initial_lr
-                + (1 - self.hparams.final_lr / self.hparams.initial_lr) * cosine_decay
-            )
-            return decayed
-
-        sched_jepa = {
-            "scheduler": LambdaLR(opt_jepa, lr_lambda=lr_lambda),
-            "interval": "step",
-            "frequency": 1,
-        }
-
-        # ---------------------------
-        # 2️⃣ Decoder Optimizer (independent)
-        # ---------------------------
-        opt_decoder = torch.optim.AdamW(
-            self.decoder.parameters(),
-            lr=5e-5,
-            weight_decay=0.0,
-        )
-
-        # Return both optimizers
-        return [opt_jepa, opt_decoder], [sched_jepa]
-
-    
-
-
-
-class JEPA_Regularized(L.LightningModule):
-    def __init__(
-        self,
-        # Optimization hyperparameters
-        initial_lr=1e-4,
-        final_lr=1e-6,
-        weight_decay=1e-4,
-        warmup_steps=1000,
-        # Loss hyperparameters
-        idm_weight=1.,
-        tvcreg_weight=0.1,
-        # Model hyperparameters
-        target_shape=(26, 26)
-    ):
-        super().__init__()
-        self.automatic_optimization = False
-        self.save_hyperparameters()
-
-        # Encoder
-        self.visual_encoder      = MeNet6()
-        self.action_encoder      = Expander2D(target_shape=target_shape, out_channels=2)
-        self.proprio_encoder     = Expander2D(target_shape=target_shape, out_channels=2)
-
-        # Predictor
-        self.predictor           = ConvPredictor()
+        # Encoders
+        self.visual_encoder     = VisualEncoder(emb_dim=emb_dim, depth=depth, heads=heads, mlp_dim=mlp_dim, patch_size=8)
+        self.proprio_encoder    = ProprioEncoder(emb_dim=emb_dim)
+        self.action_encoder     = ProprioEncoder(emb_dim=emb_dim, input_dim=2)
 
         # Decoders
-        self.idm                 = InverseDynamicsModel(action_dim=2, hidden_dim=256)
-        self.idm                 = torch.compile(self.idm, mode='default')
-        self.visual_decoder      = MeNet6Decoder128()
-
-        # Losses
-        self.prediction_cost     = nn.MSELoss()
-        self.idm_cost            = nn.MSELoss()
-        self.reconstruction_cost = nn.MSELoss()
-        self.temporal_vcreg      = TemporalVICRegLoss()
-
-
-    def encode(self, states, frames, actions):
-        B, T, _ = actions.shape
-
-        # Flatten batch and time dimensions
-        states = states.flatten(0, 1)[:, 2:] # We remove the global x,y position and only keep the velocities
-        frames = frames.flatten(0, 1)
-        actions = actions.flatten(0, 1)
-
-        # Encode everything
-        z_states = self.proprio_encoder(states)
-        z_frames = self.visual_encoder(frames)
-        z_actions = self.action_encoder(actions)
-
-        # Reshape back to (B, T, C, H, W)
-        z_states = z_states.view(B, T+1, 2, 26, 26)
-        z_frames = z_frames.view(B, T+1, 16, 26, 26)
-        z_actions = z_actions.view(B, T, 2, 26, 26)
-
-        return z_states, z_frames, z_actions
-
-    def forward(self, obs, proprio=None):
-        """Encodes an observation (and optional proprio) into a latent representation."""
-        z_obs = self.encoder(obs)
-        if proprio is not None:
-            z_prop = self.proprio_encoder(proprio)
-            z = torch.cat([z_obs, z_prop], dim=1)
-        else:
-            z = z_obs
-        return z
-
-    def predict_next(self, z_state, z_action):
-        """Predicts the next latent state given context latent and action."""
-        z = torch.cat([z_state, z_action], dim=1)
-        z_next_state_pred = self.predictor(z)
-        return z_next_state_pred
-        
-
-    def shared_step(self, batch, batch_idx):
-        """
-        batch = (obs_t, obs_tp, proprio_t, action_t)
-        where:
-          obs_t     : context frame
-          obs_tp    : target future frame
-          proprio_t : optional proprio features
-          action_t  : optional actions
-        """
-        states, frames, actions = batch
-        B, T, _ = actions.shape
-
-        # Encode everything
-        z_states, z_frames, z_actions = self.encode(
-            states, frames, actions
+        self.visual_decoder  = VisualDecoder(
+            emb_dim=emb_dim,
+            patch_size=8,
+        )
+        self.proprio_decoder = ProprioDecoder(emb_dim=emb_dim, hidden_dim=64)
+        self.idm_visual = nn.Sequential(
+            nn.LayerNorm(emb_dim * 2),
+            nn.Linear(emb_dim * 2, emb_dim),
+            nn.ReLU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+        self.idm_proprio = nn.Sequential(
+            nn.LayerNorm(emb_dim * 2),
+            nn.Linear(emb_dim * 2, emb_dim),
+            nn.ReLU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+        self.state_from_patches_decoder = RegressionTransformerDecoder(
+            d_model=emb_dim,
+            d_out=emb_dim,
+            num_layers=1,
+            nhead=2,
+            dim_feedforward=64,
+            num_queries=1,
         )
 
-        # Split between current and next time step
-        z_states_curr = z_states[:, :-1]
-        z_states_next = z_states[:, 1:]
-        z_frames_curr = z_frames[:, :-1]
-        z_frames_next = z_frames[:, 1:]
+        # Projections for VICReg
+        self.proj_cls       = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
+        self.proj_patch     = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)  # applied per token
+        self.proj_cross_vis = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)  # CLS→proj
+        self.proj_cross_pos = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)  # PosToken→proj
 
-        # Flatten batch and time dimensions
-        z_states_curr = z_states_curr.flatten(0,1)
-        z_states_next = z_states_next.flatten(0,1)
-        z_frames_curr = z_frames_curr.flatten(0,1)
-        z_frames_next = z_frames_next.flatten(0,1)
-        z_actions     = z_actions.flatten(0,1)
+        # Compile all the networks
+        if compile:
+            self.visual_encoder     = torch.compile(self.visual_encoder)
+            self.proprio_encoder    = torch.compile(self.proprio_encoder)
+            self.action_encoder     = torch.compile(self.action_encoder)
+            self.proj_cls           = torch.compile(self.proj_cls)
+            self.proj_patch         = torch.compile(self.proj_patch)
+            self.proj_cross_vis     = torch.compile(self.proj_cross_vis)
+            self.proj_cross_pos     = torch.compile(self.proj_cross_pos)
+            self.visual_decoder     = torch.compile(self.visual_decoder)
+            self.proprio_decoder    = torch.compile(self.proprio_decoder)
+            self.idm_visual        = torch.compile(self.idm_visual)
+            self.idm_proprio       = torch.compile(self.idm_proprio)
+            self.state_from_patches_decoder = torch.compile(self.state_from_patches_decoder)
 
-        # A latent state is the concatenation of visual and proprioceptive latents
-        z_state_curr = torch.cat([z_states_curr, z_frames_curr], dim=1)
-        z_state_next = torch.cat([z_states_next, z_frames_next], dim=1)
+        # Losses
+        self.vicreg_loss = VICRegLoss()
+        # self.focal_loss = FocalReconstructionLoss(gamma=2.0, alpha=0.5)
 
-        # Predict the next latent state
-        z_state_next_pred = self.predict_next(z_state_curr, z_actions)
-        loss_prediction   = self.prediction_cost(z_state_next_pred, z_state_next)
-        # print("Loss Prediction:", loss_prediction.item())
+        self._decoder_delay_steps = decoder_delay_steps
+        self._global_step = 0
 
-        # Predict the action taken
-        action_pred = self.idm(z_state_curr, z_state_next)
-        loss_idm    = self.idm_cost(action_pred, actions.flatten(0,1))
-        # print("Loss IDM:", loss_idm.item())
+    def shared_step(self, batch, batch_idx):
+        (state_curr, frame_curr), action, (state_next, frame_next), _ = batch
 
-        # Regularization loss
-        # Concatenate along channel dimension → (B, T+1, C_total, H, W)
-        z_combined = torch.cat([z_states, z_frames], dim=2)
-        # Flatten spatial dimensions to match VCReg expected input (B, T+1, D)
-        B, T1, C, H, W = z_combined.shape
-        z_flat = z_combined.view(B, T1, C * H * W)
-        # Compute VCReg loss
-        loss_tvcreg = self.temporal_vcreg(z_flat)
-        # print("Loss TVCReg:", loss_tvcreg['loss'].item())
+        # 1) Encode both views (vision branch)
+        cls_curr, patch_curr, _ = self.visual_encoder(frame_curr)      # (B, D), (B, N, D)
+        cls_next, patch_next, _ = self.visual_encoder(frame_next)      # (B, D), (B, N, D)
+        z_state_curr = self.proprio_encoder(state_curr)
+        z_state_next = self.proprio_encoder(state_next)
+        z_action = self.action_encoder(action)
+
+        # Temporal VCReg losses on patches
+        patch_curr_proj = self.proj_patch(patch_curr).flatten(0, 1)
+        patch_next_proj = self.proj_patch(patch_next).flatten(0, 1)
+        vcreg_patch_curr = 15 * VICRegLoss.variance_loss(patch_curr_proj, 1.0) + VICRegLoss.covariance_loss(patch_curr_proj)
+        vcreg_patch_next = 15 * VICRegLoss.variance_loss(patch_next_proj, 1.0) + VICRegLoss.covariance_loss(patch_next_proj)
+        vcreg_patch = (vcreg_patch_curr + vcreg_patch_next) / 2.0
+
+        # Temporal VICReg loss on global CLS token
+        cls_curr_proj = self.proj_cls(cls_curr)  # (B, D)
+        cls_next_proj = self.proj_cls(cls_next)  # (B, D)
+        vcreg_cls_curr = 15 * VICRegLoss.variance_loss(cls_curr_proj, 1.0) + VICRegLoss.covariance_loss(cls_curr_proj)
+        vcreg_cls_next = 15 * VICRegLoss.variance_loss(cls_next_proj, 1.0) + VICRegLoss.covariance_loss(cls_next_proj)
+        vcreg_cls = (vcreg_cls_curr + vcreg_cls_next) / 2.0
+
+        # Temporal VICReg loss on state tokens
+        z_state_curr_proj = self.proj_cross_pos(z_state_curr)
+        z_state_next_proj = self.proj_cross_pos(z_state_next)
+        vcreg_state_curr = 15 * VICRegLoss.variance_loss(z_state_curr_proj, 1.0) + VICRegLoss.covariance_loss(z_state_curr_proj)
+        vcreg_state_next = 15 * VICRegLoss.variance_loss(z_state_next_proj, 1.0) + VICRegLoss.covariance_loss(z_state_next_proj)
+        vcreg_state = (vcreg_state_curr + vcreg_state_next) / 2.0
+
+        # Invariance between state and visual CLS tokens
+        z_cross_vis_curr = self.proj_cross_vis(cls_curr.detach())
+        z_cross_vis_next = self.proj_cross_vis(cls_next.detach())
+        vicreg_cross_curr = F.mse_loss(z_cross_vis_curr, z_state_curr_proj)
+        vicreg_cross_next = F.mse_loss(z_cross_vis_next, z_state_next_proj)
+        vicreg_cross = (vicreg_cross_curr + vicreg_cross_next) / 2.0
+
+        # Decode z_state_curr, z_state_next from visual patches
+        state_from_patches_curr = self.state_from_patches_decoder(patch_curr).squeeze(1)  # (B, D)
+        state_from_patches_next = self.state_from_patches_decoder(patch_next).squeeze(1)  # (B, D)
+        state_from_patches_loss_curr = F.mse_loss(state_from_patches_curr, z_state_curr)
+        state_from_patches_loss_next = F.mse_loss(state_from_patches_next, z_state_next)
+        state_from_patches_loss = (state_from_patches_loss_curr + state_from_patches_loss_next) / 2.0
+
+        # Decode action from visual cls, proprio state and visual patches
+        idm_input_visual = torch.cat([cls_curr, cls_next], dim=-1)
+        idm_input_proprio = torch.cat([z_state_curr, z_state_next], dim=-1)
+        idm_input_patches = torch.cat([patch_curr, patch_next], dim=-2)
+        idm_pred_visual = self.idm_visual(idm_input_visual)
+        idm_pred_proprio = self.idm_proprio(idm_input_proprio)
+        idm_pred_patches = self.state_from_patches_decoder(idm_input_patches).squeeze(1)
+        idm_visual_loss = F.mse_loss(idm_pred_visual, z_action)
+        idm_proprio_loss = F.mse_loss(idm_pred_proprio, z_action)
+        idm_patches_loss = F.mse_loss(idm_pred_patches, z_action)
+
+        idm_loss = (idm_visual_loss + idm_proprio_loss + idm_patches_loss) / 3.0
+
+
+        # Visual reconstruction probe
+        frame_curr_recon = self.visual_decoder(patch_curr.detach())  # (B,3,64,64)
+        frame_next_recon = self.visual_decoder(patch_next.detach())  # (B,3,64,64)
+        # alpha = 0.9
+        # visual_recon_loss_curr = alpha * self.focal_loss(frame_curr_recon, frame_curr) + (1 - alpha) * F.mse_loss(frame_curr_recon, frame_curr)
+        # visual_recon_loss_next = alpha * self.focal_loss(frame_next_recon, frame_next) + (1 - alpha) * F.mse_loss(frame_next_recon, frame_next)
+        visual_recon_loss_curr = F.mse_loss(frame_curr_recon, frame_curr)
+        visual_recon_loss_next = F.mse_loss(frame_next_recon, frame_next)
+        visual_recon_loss = (visual_recon_loss_curr + visual_recon_loss_next) / 2.0
+
+
+        # Proprio reconstruction probe
+        state_curr_recon = self.proprio_decoder(z_state_curr.detach())   # (B,4)
+        state_next_recon = self.proprio_decoder(z_state_next.detach())   # (B,4)
+        proprio_recon_loss_curr = F.mse_loss(state_curr_recon, state_curr)
+        proprio_recon_loss_next = F.mse_loss(state_next_recon, state_next)
+        proprio_recon_loss = (proprio_recon_loss_curr + proprio_recon_loss_next) / 2.0
+        
+        recon_loss_curr = visual_recon_loss_curr + proprio_recon_loss_curr
+        recon_loss_next = visual_recon_loss_next + proprio_recon_loss_next
+        recon_loss = (recon_loss_curr + recon_loss_next) / 2.0
 
         # Total loss
-        loss = loss_prediction + self.hparams.idm_weight * loss_idm  + self.hparams.tvcreg_weight * loss_tvcreg['loss']
-        # print("Total Loss:", loss.item())
-        
-        # Reconstruct
-        frames_pred = self.visual_decoder(z_combined.flatten(0,1).detach())
-        loss_reconstruction = self.reconstruction_cost(frames_pred, frames.flatten(0,1))
-        # print("Loss Reconstruction:", loss_reconstruction.item())
-
-        return {'loss': loss,
-                'loss_prediction': loss_prediction,
-                'loss_idm': loss_idm,
-                'loss_tvcreg': loss_tvcreg['loss'],
-                'loss_std_t': loss_tvcreg['std_t'],
-                'loss_cov_t': loss_tvcreg['cov_t'],
-                'loss_reconstruction': loss_reconstruction
-                }
-
-
-    def training_step(self, batch, batch_idx):
-        # Hyperparameter: number of batches to accumulate before stepping
-        grad_acc_steps = 128
-
-        # Compute loss dictionary
-        loss_dict = self.shared_step(batch, batch_idx)
-        self.log_dict({f"train/{k}": v for k, v in loss_dict.items()},
-                    prog_bar=True, sync_dist=True)
-
-        # Get optimizers and scheduler
-        opt_jepa, opt_decoder = self.optimizers()
-        lr_sched_jepa = self.lr_schedulers()
-
-        # ---- JEPA main loss ----
-        loss_jepa = loss_dict["loss"] / grad_acc_steps
-        self.manual_backward(loss_jepa)
-
-        if (batch_idx + 1) % grad_acc_steps == 0:
-            # Clip and step
-            torch.nn.utils.clip_grad_norm_(
-                list(self.visual_encoder.parameters())
-                + list(self.predictor.parameters())
-                + list(self.idm.parameters())
-                + list(self.proprio_encoder.parameters())
-                + list(self.action_encoder.parameters()),
-                max_norm=1.0
-            )
-            opt_jepa.step()
-            opt_jepa.zero_grad()
-            lr_sched_jepa.step()
-
-        # ---- Decoder reconstruction loss ----
-        loss_decoder = loss_dict["loss_reconstruction"] / grad_acc_steps
-        self.manual_backward(loss_decoder)
-
-        if (batch_idx + 1) % grad_acc_steps == 0:
-            torch.nn.utils.clip_grad_norm_(self.visual_decoder.parameters(), max_norm=1.0)
-            opt_decoder.step()
-            opt_decoder.zero_grad()
-
-        return loss_dict["loss"]
-
-    def validation_step(self, batch, batch_idx):
-        loss = self.shared_step(batch, batch_idx)
-        self.log_dict({ f'val/{k}': v for k, v in loss.items() }, prog_bar=True, sync_dist=True)
-
-    
-    def configure_optimizers(self):
-        # ---------------------------
-        # 1️⃣ JEPA Optimizer (main)
-        # ---------------------------
-        opt_jepa = torch.optim.AdamW(
-            list(self.visual_encoder.parameters())
-            + list(self.predictor.parameters())
-            + list(self.idm.parameters())
-            + list(self.proprio_encoder.parameters())
-            + list(self.action_encoder.parameters()),
-            lr=self.hparams.initial_lr,
-            weight_decay=self.hparams.weight_decay
+        loss = (
+            recon_loss +
+            idm_loss +
+            self.hparams.vc_global_coeff * vcreg_cls +
+            self.hparams.vc_patch_coeff  * vcreg_patch +
+            self.hparams.vic_state_coeff  * vcreg_state +
+            vicreg_cross + state_from_patches_loss
         )
 
-        def lr_lambda(step: int):
-            if self.trainer is None or not hasattr(self.trainer, "estimated_stepping_batches"):
-                max_steps = 100_000  # fallback
-            else:
-                max_steps = self.trainer.estimated_stepping_batches
-
-            # Linear warmup
-            if step < self.hparams.warmup_steps:
-                return step / float(self.hparams.warmup_steps)
-
-            # Cosine decay
-            progress = (step - self.hparams.warmup_steps) / float(
-                max(1, max_steps - self.hparams.warmup_steps)
-            )
-            cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-            decayed = (
-                self.hparams.final_lr / self.hparams.initial_lr
-                + (1 - self.hparams.final_lr / self.hparams.initial_lr) * cosine_decay
-            )
-            return decayed
-
-        sched_jepa = {
-            "scheduler": LambdaLR(opt_jepa, lr_lambda=lr_lambda),
-            "interval": "step",
-            "frequency": 1,
-        }
-
-        # ---------------------------
-        # 2️⃣ Decoder Optimizer (independent)
-        # ---------------------------
-        opt_decoder = torch.optim.AdamW(
-            self.visual_decoder.parameters(),
-            lr=self.hparams.initial_lr / 5.0,
-            weight_decay=0.0,
-        )
-
-        # Return both optimizers
-        return [opt_jepa, opt_decoder], [sched_jepa]
-
-
-
-
-
-
-
-
-
-
-class JEPA_TransformerTS(L.LightningModule):
-    def __init__(
-        self,
-        encoder_weights : str =None,
-        # Optimization hyperparameters
-        initial_lr=1e-4,
-        final_lr=1e-6,
-        weight_decay=1e-4,
-        warmup_steps=1000,
-        grad_acc_steps=1,
-        encoder_momentum=0.999,
-        # Loss hyperparameters
-        idm_weight=1.0,
-    ):
-        super().__init__()
-        self.automatic_optimization = False
-        self.save_hyperparameters()
-
-        # Encoder
-        self.visual_encoder_teacher      = SimpleViT(
-            image_size=64,
-            patch_size=8,
-            dim=32,
-            depth=3,
-            heads=4,
-            mlp_dim=128,
-        )
-        self.visual_encoder_student      = deepcopy(self.visual_encoder_teacher)
-        if encoder_weights is not None:
-            encoder_weights = torch.load(encoder_weights)
-            self.visual_encoder_student.load_state_dict(encoder_weights)
-            self.visual_encoder_teacher.load_state_dict(encoder_weights)
-        # Freeze student encoder
-        for param in self.visual_encoder_student.parameters():
-            param.requires_grad = False
-        self.visual_encoder_student.eval()
-        self.proprio_encoder       = nn.Sequential(
-            Expander1D(out_dim=32),
-            nn.BatchNorm1d(32),
-        )
-        self.action_encoder        = nn.Sequential(
-            Expander1D(out_dim=32),
-            nn.BatchNorm1d(32),
-        )
-
-        self.visual_encoder_teacher      = torch.compile(self.visual_encoder_teacher, mode='default')
-        self.visual_encoder_student      = torch.compile(self.visual_encoder_student, mode='default')
-        self.action_encoder      = torch.compile(self.action_encoder, mode='default')
-        self.proprio_encoder     = torch.compile(self.proprio_encoder, mode='default')
-
-        # Predictor
-        self.predictor           = TransformerPredictor(
-            dim=32,
-            depth=3,
-            heads=4,
-            dim_head=8,
-            mlp_dim=128,
-            num_latents=32
-        )
-        self.predictor           = torch.compile(self.predictor, mode='default')
-
-        # Decoders
-        self.idm = InverseDynamicsTransformer(
-            dim=32,
-            depth=1,
-            heads=2,
-            dim_head=8,
-            mlp_dim=128,
-            out_dim=2
-        )
-
-        self.idm                 = torch.compile(self.idm, mode='default')
-        self.visual_decoder      = VisualDecoderSimple(
-            image_size=64,
-            patch_size=8,
-            dim=32,
-            out_channels=3
-        )
-
-        # Losses
-        self.prediction_cost     = nn.MSELoss()
-        self.idm_cost            = nn.MSELoss()
-        self.reconstruction_cost = nn.MSELoss()
-
-
-    def encode(
-        self,
-        state,
-        frame,
-        action,
-        next_state,
-        next_frame
-    ):
-        """Encodes state, action, and next_state into latent representations."""
-        z_state         = self.proprio_encoder(state).unsqueeze(1)
-        z_frame         = self.visual_encoder_teacher(frame)
-        z_action        = self.action_encoder(action).unsqueeze(1)
-        with torch.no_grad():
-            z_next_state    = self.proprio_encoder(next_state).unsqueeze(1)
-            z_next_frame    = self.visual_encoder_student(next_frame)
-        z_state = torch.cat([z_frame, z_state], dim=1)
-        z_next_state = torch.cat([z_next_frame, z_next_state], dim=1)
-
-        return z_state, z_action, z_next_state
-
-
-    def predict_next(self, z_state, z_action):
-        """Predicts the next latent state given context latent and action."""
-        z_next_state_pred = self.predictor(z_state, z_action) + z_state
-        return z_next_state_pred
-        
-    def shared_step(self, batch, batch_idx):
-        """
-        batch = (obs_t, obs_tp, proprio_t, action_t)
-        where:
-          obs_t     : context frame
-          obs_tp    : target future frame
-          proprio_t : optional proprio features
-          action_t  : optional actions
-        """
-        (state, frame), action, (next_state, next_frame) = batch
-
-        # --------------------------------------------------
-        # Encode
-        # --------------------------------------------------
-        z_state, z_action, z_next_state = self.encode(state, frame, action, next_state, next_frame)
-
-        # --------------------------------------------------
-        # Predict next latent and action
-        # --------------------------------------------------
-        z_next_state_pred = self.predict_next(z_state, z_action)
-        action_pred = self.idm(z_state, z_next_state.detach())
-
-        # --------------------------------------------------
-        # 🔸 Latent dynamic weighting (visual only)
-        # --------------------------------------------------
-        # Separate visual and proprio parts
-        z_next_state_visual = z_next_state[:, :-1]
-        z_next_state_pred_visual = z_next_state_pred[:, :-1]
-
-        # # Compute motion mask only on visual latents
-
-        # Weighted prediction loss on visual part
-        loss_prediction_visual = F.mse_loss(
-            z_next_state_pred_visual,
-            z_next_state_visual.detach()
-        )
-
-        # Standard (unweighted) prediction loss on proprio latent
-        loss_prediction_proprio = F.mse_loss(
-            z_next_state_pred[:, -1],
-            z_next_state[:, -1].detach()
-        )
-        loss_prediction = self.prediction_cost(
-            z_next_state_pred,
-            z_next_state.detach()
-        )
-        loss_anti_collapse = F.relu(1 - F.l1_loss(z_state, z_next_state.detach()))
-
-        # --------------------------------------------------
-        # Inverse Dynamics loss
-        # --------------------------------------------------
-        loss_idm = self.idm_cost(action_pred, action)
-        loss = loss_prediction + self.hparams.idm_weight * loss_idm + loss_anti_collapse
-
-        # --------------------------------------------------
-        # 🔸 Motion-weighted reconstruction
-        # --------------------------------------------------
-        frame_recon = self.visual_decoder(z_state.detach())
-        next_frame_recon = self.visual_decoder(z_next_state.detach())
-
-        loss_reconstruction = 0.0
-        loss_reconstruction += self.reconstruction_cost(frame_recon, frame)
-        loss_reconstruction += self.reconstruction_cost(next_frame_recon, next_frame)
-        loss_reconstruction /= 2.0
-
-        # --------------------------------------------------
-        # Return all components
-        # --------------------------------------------------
         return {
-            'loss': loss,
-            'loss_prediction': loss_prediction,
-            'loss_prediction_visual': loss_prediction_visual,
-            'loss_prediction_proprio': loss_prediction_proprio,
-            'loss_idm': loss_idm,
-            'loss_reconstruction': loss_reconstruction,
-            'loss_anti_collapse': loss_anti_collapse,
+            "loss": loss,
+            "recon_loss": recon_loss,
+            # "recon_loss_curr": recon_loss_curr,
+            # "recon_loss_next": recon_loss_next,
+            "proprio_recon_loss": proprio_recon_loss,
+            # "proprio_recon_loss_curr": proprio_recon_loss_curr,
+            # "proprio_recon_loss_next": proprio_recon_loss_next,
+            "visual_recon_loss": visual_recon_loss,
+            # "visual_recon_loss_curr": visual_recon_loss_curr,
+            # "visual_recon_loss_next": visual_recon_loss_next,
+            "idm_loss": idm_loss,       
+            "idm_visual_loss": idm_visual_loss,
+            "idm_proprio_loss": idm_proprio_loss,
+            "idm_patches_loss": idm_patches_loss,
+            "vcreg_cls": vcreg_cls,
+            # "vcreg_cls_curr": vcreg_cls_curr,
+            # "vcreg_cls_next": vcreg_cls_next,
+            "vcreg_patch": vcreg_patch,
+            # "vcreg_patch_curr": vcreg_patch_curr,
+            # "vcreg_patch_next": vcreg_patch_next,
+            "vcreg_state": vcreg_state,
+            # "vcreg_state_curr": vcreg_state_curr,
+            # "vcreg_state_next": vcreg_state_next,
+            "vicreg_cross": vicreg_cross,
+            # "vicreg_cross_curr": vicreg_cross_curr,
+            # "vicreg_cross_next": vicreg_cross_next,
+            "state_from_patches_loss": state_from_patches_loss,
+            # "state_from_patches_loss_curr": state_from_patches_loss_curr,
+            # "state_from_patches_loss_next": state_from_patches_loss_next,
         }
-
 
     def training_step(self, batch, batch_idx):
-        # Get optimizers and schedulers
-        opt_jepa, opt_decoder = self.optimizers()
-        lr_sched_jepa = self.lr_schedulers()
-
-
-        loss = self.shared_step(batch, batch_idx)
-
-        self.log_dict({ f'train/{k}': v for k, v in loss.items() }, prog_bar=True, sync_dist=True)
-
-        loss_jepa = loss['loss']
-        self.manual_backward(loss_jepa)
-        torch.nn.utils.clip_grad_norm_(
-            list(self.visual_encoder_teacher.parameters())
-            + list(self.predictor.parameters())
-            + list(self.idm.parameters())
-            + list(self.proprio_encoder.parameters())
-            + list(self.action_encoder.parameters()),
-            max_norm=1.0
-        )
-        opt_jepa.step()
-        opt_jepa.zero_grad()
-        lr_sched_jepa.step()
-
-        with torch.no_grad():
-            for student_param, teacher_param in zip(
-                self.visual_encoder_student.parameters(),
-                self.visual_encoder_teacher.parameters()
-            ):
-                student_param.data.mul_(self.hparams.encoder_momentum)
-                student_param.data.add_(
-                    (1 - self.hparams.encoder_momentum) * teacher_param.data
-                )
-
-        loss_decoder = loss['loss_reconstruction']
-        self.manual_backward(loss_decoder)
-        torch.nn.utils.clip_grad_norm_(
-            self.visual_decoder.parameters(),
-            max_norm=1.0
-        )
-        opt_decoder.step()
-        opt_decoder.zero_grad()
-
-        return loss['loss']
-    
+        outs = self.shared_step(batch, batch_idx)
+        self.log_dict({f"train/{k}": v for k, v in outs.items()}, prog_bar=True, sync_dist=True)
+        self._global_step += 1
+        return outs["loss"]
     def validation_step(self, batch, batch_idx):
-        loss = self.shared_step(batch, batch_idx)
-        self.log_dict({ f'val/{k}': v for k, v in loss.items() }, prog_bar=True, sync_dist=True)
-        return loss['loss']
+        outs = self.shared_step(batch, batch_idx)
+        self.log_dict({f"val/{k}": v for k, v in outs.items()}, prog_bar=True, sync_dist=True)
+        return outs["loss"]
 
     def configure_optimizers(self):
-        # ---------------------------
-        # 1️⃣ JEPA Optimizer (main)
-        # ---------------------------
-        opt_jepa = torch.optim.AdamW(
-            list(self.visual_encoder_teacher.parameters())
-            + list(self.predictor.parameters())
-            + list(self.idm.parameters())
-            + list(self.proprio_encoder.parameters())
-            + list(self.action_encoder.parameters()),
-            lr=self.hparams.initial_lr,
-            weight_decay=self.hparams.weight_decay
-        )
-
-        def lr_lambda(step: int):
-            if self.trainer is None or not hasattr(self.trainer, "estimated_stepping_batches"):
-                max_steps = 100_000  # fallback
-            else:
-                max_steps = self.trainer.estimated_stepping_batches
-
-            # Linear warmup
-            if step < self.hparams.warmup_steps:
-                return step / float(self.hparams.warmup_steps)
-
-            # Cosine decay
-            progress = (step - self.hparams.warmup_steps) / float(
-                max(1, max_steps - self.hparams.warmup_steps)
-            )
-            cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-            decayed = (
-                self.hparams.final_lr / self.hparams.initial_lr
-                + (1 - self.hparams.final_lr / self.hparams.initial_lr) * cosine_decay
-            )
-            return decayed
-
-        sched_jepa = {
-            "scheduler": LambdaLR(opt_jepa, lr_lambda=lr_lambda),
-            "interval": "step",
-            "frequency": 1,
+        # ----------------------------
+        # Param groups
+        # ----------------------------
+        encoder_params = {
+            "params": list(self.visual_encoder.parameters())
+                    + list(self.proprio_encoder.parameters())
+                    + list(self.action_encoder.parameters())
+                    + list(self.proj_cls.parameters())
+                    + list(self.proj_patch.parameters())
+                    + list(self.proj_cross_vis.parameters())
+                    + list(self.proj_cross_pos.parameters()),
+            "lr": self.hparams.initial_lr_encoder,          # encoder LR
+            "weight_decay": self.hparams.weight_decay_encoder,
         }
 
-        # ---------------------------
-        # 2️⃣ Decoder Optimizer (independent)
-        # ---------------------------
-        opt_decoder = torch.optim.AdamW(
-            self.visual_decoder.parameters(),
-            lr=5e-5,
-            weight_decay=0.0,
+        decoder_params = {
+            "params": list(self.visual_decoder.parameters())
+                    + list(self.proprio_decoder.parameters())
+                    + list(self.state_from_patches_decoder.parameters()),
+            "lr": self.hparams.initial_lr_decoder,    # <-- smaller LR for decoder
+            "weight_decay": 0.0,                    # <-- common choice: no WD on decoder
+        }
+
+        idm_params = {
+            "params": list(self.idm_visual.parameters())
+                    + list(self.idm_proprio.parameters()),
+            "lr": self.hparams.initial_lr_idm,          # same as encoder
+            "weight_decay": self.hparams.weight_decay_idm,
+        }
+
+        optimizer = torch.optim.AdamW(
+            [encoder_params, decoder_params, idm_params],
         )
 
-        # Return both optimizers
-        return [opt_jepa, opt_decoder], [sched_jepa]
-
-
-
-
-
-
-
-class JEPA_TransformerSimple(L.LightningModule):
-    def __init__(
-        self,
-        # Optimization hyperparameters
-        initial_lr=1e-4,
-        final_lr=1e-6,
-        weight_decay=1e-4,
-        warmup_steps=1000,
-        grad_acc_steps=1,
-        # Loss hyperparameters
-        idm_weight=1.0,
-    ):
-        super().__init__()
-        self.automatic_optimization = False
-        self.save_hyperparameters()
-
-        # Encoder
-        self.visual_encoder      = SimpleViT(
-            image_size=64,
-            patch_size=8,
-            dim=32,
-            depth=3,
-            heads=4,
-            mlp_dim=128,
+        # ----------------------------
+        # Scheduler (warmup + cosine)
+        # ----------------------------
+        total_steps = (
+            self.trainer.max_epochs * self.trainer.estimated_stepping_batches
         )
-        self.proprio_encoder       = nn.Sequential(
-            Expander1D(out_dim=32),
-            nn.BatchNorm1d(32),
-        )
-        self.action_encoder        = nn.Sequential(
-            Expander1D(out_dim=32),
-            nn.BatchNorm1d(32),
-        )
+        warmup_steps = self.hparams.warmup_steps
 
-        self.visual_encoder      = torch.compile(self.visual_encoder, mode='default')
-        self.action_encoder      = torch.compile(self.action_encoder, mode='default')
-        self.proprio_encoder     = torch.compile(self.proprio_encoder, mode='default')
+        def lr_lambda(step):
+            if step < warmup_steps:            # warmup
+                return step / max(1, warmup_steps)
+            # cosine decay
+            t = (step - warmup_steps) / max(1, (total_steps - warmup_steps))
+            return 0.5 * (1 + math.cos(math.pi * min(max(t, 0.0), 1.0)))
 
-        # Predictor
-        self.predictor           = TransformerPredictor(
-            dim=32,
-            depth=3,
-            heads=4,
-            dim_head=8,
-            mlp_dim=128,
-            num_latents=32
-        )
-        self.predictor           = torch.compile(self.predictor, mode='default')
+        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-        # Decoders
-        self.idm = InverseDynamicsTransformer(
-            dim=32,
-            depth=1,
-            heads=2,
-            dim_head=8,
-            mlp_dim=128,
-            out_dim=2
-        )
-
-        self.idm                 = torch.compile(self.idm, mode='default')
-        self.visual_decoder      = VisualDecoderSimple(
-            image_size=64,
-            patch_size=8,
-            dim=32,
-            out_channels=3
-        )
-
-        # Losses
-        self.prediction_cost     = nn.MSELoss()
-        self.idm_cost            = nn.MSELoss()
-        self.reconstruction_cost = nn.MSELoss()
-
-
-    def encode(
-        self,
-        state,
-        frame,
-        action,
-        next_state,
-        next_frame
-    ):
-        """Encodes state, action, and next_state into latent representations."""
-        z_state         = self.proprio_encoder(state).unsqueeze(1)
-        z_frame         = self.visual_encoder(frame)
-        z_action        = self.action_encoder(action).unsqueeze(1)
-        z_next_state    = self.proprio_encoder(next_state).unsqueeze(1)
-        z_next_frame    = self.visual_encoder(next_frame)
-        z_state = torch.cat([z_frame, z_state], dim=1)
-        z_next_state = torch.cat([z_next_frame, z_next_state], dim=1)
-
-        return z_state, z_action, z_next_state
-
-
-    def predict_next(self, z_state, z_action):
-        """Predicts the next latent state given context latent and action."""
-        z_next_state_pred = self.predictor(z_state, z_action) + z_state
-        return z_next_state_pred
-        
-    def shared_step(self, batch, batch_idx):
-        """
-        batch = (obs_t, obs_tp, proprio_t, action_t)
-        where:
-          obs_t     : context frame
-          obs_tp    : target future frame
-          proprio_t : optional proprio features
-          action_t  : optional actions
-        """
-        (state, frame), action, (next_state, next_frame) = batch
-
-        # --------------------------------------------------
-        # Encode
-        # --------------------------------------------------
-        z_state, z_action, z_next_state = self.encode(state, frame, action, next_state, next_frame)
-
-        # --------------------------------------------------
-        # Predict next latent and action
-        # --------------------------------------------------
-        z_next_state_pred = self.predict_next(z_state, z_action)
-        with torch.no_grad():
-            loss_prediction_visual  = F.mse_loss(
-                z_next_state_pred[:, :-1],
-                z_next_state[:, :-1]
-            )
-            loss_prediction_proprio = F.mse_loss(
-                z_next_state_pred[:, -1],
-                z_next_state[:, -1]
-            )
-
-        # --------------------------------------------------
-        # 🔸 Latent dynamic weighting (visual only)
-        # --------------------------------------------------
-        loss_prediction = self.prediction_cost(
-            z_next_state_pred,
-            z_next_state
-        )
-        loss_anti_collapse = F.relu(0.5 - F.l1_loss(z_state, z_next_state))
-
-        # --------------------------------------------------
-        # Inverse Dynamics loss
-        # --------------------------------------------------
-        action_pred = self.idm(z_state, z_next_state)
-        loss_idm = self.idm_cost(action_pred, action)
-        loss = loss_prediction + loss_anti_collapse + self.hparams.idm_weight * loss_idm
-
-        # --------------------------------------------------
-        # 🔸 Motion-weighted reconstruction
-        # --------------------------------------------------
-        frame_recon = self.visual_decoder(z_state.detach()[:, :-1])
-        next_frame_recon = self.visual_decoder(z_next_state.detach()[:, :-1])
-
-        loss_reconstruction = 0.0
-        loss_reconstruction += self.reconstruction_cost(frame_recon, frame)
-        loss_reconstruction += self.reconstruction_cost(next_frame_recon, next_frame)
-        loss_reconstruction /= 2.0
-
-        # --------------------------------------------------
-        # Return all components
-        # --------------------------------------------------
         return {
-            'loss': loss,
-            'loss_prediction': loss_prediction,
-            'loss_prediction_visual': loss_prediction_visual,
-            'loss_prediction_proprio': loss_prediction_proprio,
-            'loss_idm': loss_idm,
-            'loss_reconstruction': loss_reconstruction,
-            'loss_anti_collapse': loss_anti_collapse,
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
         }
-
-
-    def training_step(self, batch, batch_idx):
-        # Get optimizers and schedulers
-        opt_jepa, opt_decoder = self.optimizers()
-        lr_sched_jepa = self.lr_schedulers()
-
-
-        loss = self.shared_step(batch, batch_idx)
-
-        self.log_dict({ f'train/{k}': v for k, v in loss.items() }, prog_bar=True, sync_dist=True)
-
-        loss_jepa = loss['loss']
-        self.manual_backward(loss_jepa)
-        torch.nn.utils.clip_grad_norm_(
-            list(self.visual_encoder.parameters())
-            + list(self.predictor.parameters())
-            + list(self.idm.parameters())
-            + list(self.proprio_encoder.parameters())
-            + list(self.action_encoder.parameters()),
-            max_norm=1.0
-        )
-        opt_jepa.step()
-        opt_jepa.zero_grad()
-        lr_sched_jepa.step()
-
-        loss_decoder = loss['loss_reconstruction']
-        self.manual_backward(loss_decoder)
-        torch.nn.utils.clip_grad_norm_(
-            self.visual_decoder.parameters(),
-            max_norm=1.0
-        )
-        opt_decoder.step()
-        opt_decoder.zero_grad()
-
-        return loss['loss']
-    
-    def validation_step(self, batch, batch_idx):
-        loss = self.shared_step(batch, batch_idx)
-        self.log_dict({ f'val/{k}': v for k, v in loss.items() }, prog_bar=True, sync_dist=True)
-        return loss['loss']
-
-    def configure_optimizers(self):
-        # ---------------------------
-        # 1️⃣ JEPA Optimizer (main)
-        # ---------------------------
-        opt_jepa = torch.optim.AdamW(
-            list(self.visual_encoder.parameters())
-            + list(self.predictor.parameters())
-            + list(self.idm.parameters())
-            + list(self.proprio_encoder.parameters())
-            + list(self.action_encoder.parameters()),
-            lr=self.hparams.initial_lr,
-            weight_decay=self.hparams.weight_decay
-        )
-
-        def lr_lambda(step: int):
-            if self.trainer is None or not hasattr(self.trainer, "estimated_stepping_batches"):
-                max_steps = 100_000  # fallback
-            else:
-                max_steps = self.trainer.estimated_stepping_batches
-
-            # Linear warmup
-            if step < self.hparams.warmup_steps:
-                return step / float(self.hparams.warmup_steps)
-
-            # Cosine decay
-            progress = (step - self.hparams.warmup_steps) / float(
-                max(1, max_steps - self.hparams.warmup_steps)
-            )
-            cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-            decayed = (
-                self.hparams.final_lr / self.hparams.initial_lr
-                + (1 - self.hparams.final_lr / self.hparams.initial_lr) * cosine_decay
-            )
-            return decayed
-
-        sched_jepa = {
-            "scheduler": LambdaLR(opt_jepa, lr_lambda=lr_lambda),
-            "interval": "step",
-            "frequency": 1,
-        }
-
-        # ---------------------------
-        # 2️⃣ Decoder Optimizer (independent)
-        # ---------------------------
-        opt_decoder = torch.optim.AdamW(
-            self.visual_decoder.parameters(),
-            lr=1e-4,
-            weight_decay=0.0,
-        )
-
-        # Return both optimizers
-        return [opt_jepa, opt_decoder], [sched_jepa]
-
-

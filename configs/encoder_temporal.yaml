@@ -6,7 +6,7 @@ trainer:
   strategy: ddp
   precision: bf16-mixed
   # gradient clipping
-  gradient_clip_val: 2.0
+  gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   # gradient accumulation (accumulate gradients for N steps before optimizer step)
   accumulate_grad_batches: 2
@@ -30,27 +30,21 @@ trainer:
       log_model: true
 
 
-# model:
-#   emb_dim: 64
-#   depth: 4
-#   heads: 4
-#   mlp_dim: 256
-#   proj_dim: 256
 model:
   emb_dim: 32
   depth: 3
   heads: 4
   mlp_dim: 64
   proj_dim: 128
-  initial_lr_encoder: 3e-3
-  final_lr_encoder: 1e-5
+  initial_lr_encoder:   3e-3
+  final_lr_encoder:     1e-5
   weight_decay_encoder: 1e-3
-  initial_lr_decoder: 3e-3
-  final_lr_decoder: 5e-6
-  weight_decay_decoder: 0
-  initial_lr_idm: 1e-3
-  final_lr_idm: 1e-5
-  weight_decay_idm: 1e-5
+  initial_lr_decoder:   2e-3
+  final_lr_decoder:     5e-6
+  weight_decay_decoder: 1e-4
+  initial_lr_idm:       1e-3
+  final_lr_idm:         1e-5
+  weight_decay_idm:     1e-5
   warmup_steps: 1000
   vc_global_coeff: 1.0
   vc_patch_coeff: 1.0
@@ -60,8 +54,9 @@ model:
 
 
 data:
-  data_path: data/train_trajectories_1000_100_4_64.npz
-  batch_size: 128
+  data_path: data/train_trajectories_1000_100_4_64_largerdot.npz
+  batch_size: 64
   num_workers: 2
   pin_memory: true
   val_size: 0.1
+  seq_len: 2

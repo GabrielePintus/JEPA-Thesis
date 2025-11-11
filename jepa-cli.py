@@ -1,7 +1,7 @@
 import torch
 from lightning.pytorch.cli import LightningCLI
-from src.jepa2 import JEPATransformerModule as JEPA
-from src.data.datamodule import PointMazeDataModule
+from src.jepa import JEPA
+from src.data.datamodule import PointMazeSequencesDataModule
 # import os
 
 
@@ -19,7 +19,7 @@ if __name__ == "__main__":
     # Lightning CLI
     LightningCLI(
         model_class=JEPA,
-        datamodule_class=PointMazeDataModule,
+        datamodule_class=PointMazeSequencesDataModule,
         seed_everything_default=SEED,
         save_config_kwargs={"overwrite": True},
     )

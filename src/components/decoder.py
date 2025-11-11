@@ -10,7 +10,7 @@ class ProprioDecoder(nn.Module):
     Simple MLP since proprio is low-dimensional.
     """
     
-    def __init__(self, emb_dim=128, state_dim=4, hidden_dim=64):
+    def __init__(self, emb_dim=128, output_dim=4, hidden_dim=64):
         super().__init__()
         
         self.net = nn.Sequential(
@@ -19,7 +19,7 @@ class ProprioDecoder(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, state_dim),
+            nn.Linear(hidden_dim, output_dim),
         )
     
     def forward(self, token):
@@ -249,7 +249,8 @@ class RegressionTransformerDecoder(nn.Module):
         patch_tokens: torch.Tensor,                 # (B, N, C)
         key_padding_mask: torch.Tensor | None = None,  # (B, N) True for pad
     ) -> torch.Tensor:
-        B, N, C = patch_tokens.shape
+        B = patch_tokens.shape[0]
+        C = patch_tokens.shape[-1]
         assert C == self.query_tokens.shape[-1], "d_model mismatch with ViT token dim"
 
         # Memory: (N, B, C)
