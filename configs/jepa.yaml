@@ -36,23 +36,23 @@ model:
   heads: 4
   mlp_dim: 64
   proj_dim: 128
-  initial_lr_encoder:   1e-3
+  initial_lr_encoder:   5e-4
   final_lr_encoder:     1e-5
   weight_decay_encoder: 1e-3
   initial_lr_decoder:   2e-3
   final_lr_decoder:     5e-6
   weight_decay_decoder: 1e-3
-  initial_lr_idm:       1e-3
+  initial_lr_idm:       5e-4
   final_lr_idm:         1e-5
   weight_decay_idm:     1e-4
-  initial_lr_predictor: 1e-3
+  initial_lr_predictor: 5e-4
   final_lr_predictor:   1e-5
-  weight_decay_predictor: 1e-4
+  weight_decay_predictor: 1e-2
   warmup_steps: 1000
   vc_global_coeff: 1.0
   vc_patch_coeff: 1.0
   vic_state_coeff: 1.0
-  compile: false
+  compile: true
   decoder_delay_steps: 0
 
 

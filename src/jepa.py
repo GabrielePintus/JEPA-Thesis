@@ -71,7 +71,7 @@ class JEPA(L.LightningModule):
         self.predictor = TransformerEncoderPredictor(
             emb_dim=emb_dim,
             num_heads=4,
-            num_layers=2,
+            num_layers=4,
             mlp_dim=128,
             residual=False
         )
