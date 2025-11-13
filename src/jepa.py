@@ -7,7 +7,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 # from src.losses import TemporalVCRegLoss
 from src.losses import TemporalVCRegLossOptimized as TemporalVCRegLoss
-from src.components.encoder import VisualEncoder, ProprioEncoder, MLPProjection
+from src.components.encoder import RepeatEncoder, VisualEncoder, ProprioEncoder, MLPProjection
 from src.components.decoder import VisualDecoder, ProprioDecoder, RegressionTransformerDecoder
 from src.components.predictor import TransformerDecoderPredictor, TransformerEncoderPredictor
 
@@ -15,7 +15,11 @@ from src.components.predictor import TransformerDecoderPredictor, TransformerEnc
 def focal_mse(pred, target, gamma=2):
     err = (pred - target)
     return ((err.abs() ** gamma) * (err ** 2))
-
+def cosine_loss(pred, target):
+    # pred: (B, ..., D)
+    # target: (B, ..., D)
+    # dim=-1 computes similarity along the embedding dimension
+    return 1.0 - F.cosine_similarity(pred, target, dim=-1).mean()
 
 
 class JEPA(L.LightningModule):
@@ -59,7 +63,7 @@ class JEPA(L.LightningModule):
         # Encoders
         self.visual_encoder     = VisualEncoder(emb_dim=emb_dim, depth=depth, heads=heads, mlp_dim=mlp_dim, patch_size=8)
         self.proprio_encoder    = ProprioEncoder(emb_dim=emb_dim)
-        self.action_encoder     = ProprioEncoder(emb_dim=emb_dim, input_dim=2)
+        self.action_encoder     = RepeatEncoder(emb_dim=emb_dim, input_dim=2)
 
         # Predictor
         # self.predictor = TransformerDecoderPredictor(
@@ -71,7 +75,7 @@ class JEPA(L.LightningModule):
         self.predictor = TransformerEncoderPredictor(
             emb_dim=emb_dim,
             num_heads=4,
-            num_layers=4,
+            num_layers=3,
             mlp_dim=128,
             residual=False
         )
@@ -315,9 +319,9 @@ class JEPA(L.LightningModule):
         # loss_pred_cls = F.mse_loss(z_cls_next_pred, z_cls_next.detach())
         # loss_pred_patches = F.mse_loss(z_patches_next_pred, z_patches_next.detach())
         # loss_pred_states = F.mse_loss(z_states_next_pred, z_states_next.detach())
-        loss_pred_cls = F.mse_loss(z_cls_next_pred, (z_cls_next - z_cls_curr).detach())
-        loss_pred_patches = F.mse_loss(z_patches_next_pred, (z_patches_next - z_patches_curr).detach())
-        loss_pred_states = F.mse_loss(z_states_next_pred, (z_states_next - z_states_curr).detach())
+        loss_pred_cls = cosine_loss(z_cls_next_pred, z_cls_next)
+        loss_pred_patches = cosine_loss(z_patches_next_pred, z_patches_next)
+        loss_pred_states = cosine_loss(z_states_next_pred, z_states_next)
 
         # Combine prediction losses
         weights = [ 1.0, 10.0, 2.0 ]

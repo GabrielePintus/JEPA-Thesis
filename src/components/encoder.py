@@ -320,6 +320,24 @@ class ProprioEncoder(nn.Module):
         return self.net(xy)  # (B, D)
 
 
+class RepeatEncoder(nn.Module):
+    """Repeat the input to fill the embedding dimension."""
+    def __init__(self, input_dim=4, emb_dim=128):
+        super().__init__()
+        self.input_dim = input_dim
+        self.emb_dim = emb_dim
+        assert emb_dim % input_dim == 0, "emb_dim must be multiple of input_dim"
+        self.repeat_times = emb_dim // input_dim
+        self.norm = nn.BatchNorm1d(emb_dim)
+
+    def forward(self, x):  # (B, input_dim)
+        x = x.unsqueeze(-1)  # (B, input_dim, 1)
+        x = x.repeat(1, 1, self.repeat_times)  # (B, input_dim, repeat_times)
+        x = x.view(x.shape[0], -1)  # (B, emb_dim)
+        x = self.norm(x)
+        return x
+
+
 class MLPProjection(nn.Module):
     def __init__(self, in_dim, proj_dim=1024):
         super().__init__()
