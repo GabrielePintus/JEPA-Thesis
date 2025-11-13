@@ -320,7 +320,8 @@ class JEPA(L.LightningModule):
         loss_pred_states = F.mse_loss(z_states_next_pred, (z_states_next - z_states_curr).detach())
 
         # Combine prediction losses
-        prediction_loss = (loss_pred_cls + loss_pred_patches + loss_pred_states) / 3.0
+        weights = [ 1.0, 10.0, 2.0 ]
+        prediction_loss = (loss_pred_cls + loss_pred_patches + loss_pred_states) / sum(weights)
 
 
 
