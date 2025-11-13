@@ -141,7 +141,7 @@ class VICRegJEPAEncoder(L.LightningModule):
 
         # Invariance between state and visual CLS tokens
         z_cross_vis_curr = self.proj_cross_vis(cls_curr.detach())
-        z_cross_vis_next = self.proj_cross_vis(cls_next.detach())
+        z_cross_vis_next = self.proj_cross_vis(cls_next.detach())   
         vicreg_cross_curr = F.mse_loss(z_cross_vis_curr, z_state_curr_proj)
         vicreg_cross_next = F.mse_loss(z_cross_vis_next, z_state_next_proj)
         vicreg_cross = (vicreg_cross_curr + vicreg_cross_next) / 2.0

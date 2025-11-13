@@ -89,7 +89,8 @@ class VICRegJEPAEncoder(L.LightningModule):
         # Projections for VICReg
         self.proj_cls       = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
         self.proj_state     = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
-        self.proj_patch     = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)  # applied per token
+        self.proj_patch     = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
+        self.proj_action    = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
         self.proj_coherence_cls = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
         self.proj_coherence_patches = RegressionTransformerDecoder(
             d_model=emb_dim,
@@ -119,7 +120,8 @@ class VICRegJEPAEncoder(L.LightningModule):
             self.proj_patch = torch.compile(self.proj_patch)
             self.proj_coherence_cls = torch.compile(self.proj_coherence_cls)
             self.proj_coherence_patches = torch.compile(self.proj_coherence_patches)        
-        
+
+
 
     def shared_step(self, batch, batch_idx):
         states, frames, actions = batch
@@ -143,7 +145,7 @@ class VICRegJEPAEncoder(L.LightningModule):
         z_states  = z_states_flatten.view(B, T+1, -1)        # (B, T+1, D)
         z_cls     = z_cls_flatten.view(B, T+1, -1)           # (B, T+1, D)
         z_patches = z_patches_flatten.view(B, T+1, z_patches_flatten.shape[1], -1) # (B, T+1, N, D)
-        z_action  = z_actions_flatten.view(B, T, -1)         # (B, T, D)
+        z_actions  = z_actions_flatten.view(B, T, -1)         # (B, T, D)
 
 
         #
@@ -163,11 +165,16 @@ class VICRegJEPAEncoder(L.LightningModule):
         z_patches_proj = self.proj_patch(z_patches).permute(0, 2, 1, 3).flatten(0, 1)
         tvcreg_patches_loss = self.tvcreg_loss(z_patches_proj)
 
+        # Temporal VCReg on actions
+        z_actions_proj = self.proj_action(z_actions)
+        tvcreg_actions_loss = self.tvcreg_loss(z_actions_proj)
+
         # Combine losses
         vcreg_loss = (
             self.hparams.vc_global_coeff * tvcreg_cls_loss["loss"] +
             self.hparams.vic_state_coeff * tvcreg_states_loss["loss"] +
-            self.hparams.vc_patch_coeff  * tvcreg_patches_loss["loss"]
+            self.hparams.vc_patch_coeff  * tvcreg_patches_loss["loss"] + 
+            1.0  * tvcreg_actions_loss["loss"]
         )
 
 
@@ -198,13 +205,13 @@ class VICRegJEPAEncoder(L.LightningModule):
         z_cls_curr, z_cls_next = z_cls[:, :-1], z_cls[:, 1:]
         idm_cls_in = torch.cat([z_cls_curr, z_cls_next], dim=-1)  # (B, T, D*2)
         idm_cls_pred = self.idm_visual(idm_cls_in)  # (B, T, D)
-        idm_visual_loss = F.mse_loss(idm_cls_pred, z_action)
+        idm_visual_loss = F.mse_loss(idm_cls_pred, z_actions)
 
         # From proprio states
         z_state_curr, z_state_next = z_states[:, :-1], z_states[:, 1:]
         idm_state_in = torch.cat([z_state_curr, z_state_next], dim=-1)  # (B, T, D*2)
         idm_state_pred = self.idm_proprio(idm_state_in)  # (B, T, D)    
-        idm_proprio_loss = F.mse_loss(idm_state_pred, z_action)
+        idm_proprio_loss = F.mse_loss(idm_state_pred, z_actions)
 
         # From visual patches
         z_patches_curr, z_patches_next = z_patches[:, :-1], z_patches[:, 1:]  # (B, T, N, D)
@@ -250,6 +257,7 @@ class VICRegJEPAEncoder(L.LightningModule):
             "vcreg_cls_loss": tvcreg_cls_loss["loss"],
             "vcreg_state_loss": tvcreg_states_loss["loss"],
             "vcreg_patch_loss": tvcreg_patches_loss["loss"],
+            "vcreg_action_loss": tvcreg_actions_loss["loss"],
             "vcreg_loss": vcreg_loss,
         }
     
@@ -274,6 +282,7 @@ class VICRegJEPAEncoder(L.LightningModule):
                     + list(self.proj_cls.parameters())
                     + list(self.proj_state.parameters())
                     + list(self.proj_patch.parameters())
+                    + list(self.proj_action.parameters())
                     + list(self.proj_coherence_cls.parameters())
                     + list(self.proj_coherence_patches.parameters()),
             "lr": self.hparams.initial_lr_encoder,          # encoder LR
@@ -285,7 +294,7 @@ class VICRegJEPAEncoder(L.LightningModule):
                     + list(self.proprio_decoder.parameters())
                     + list(self.action_decoder.parameters()),
             "lr": self.hparams.initial_lr_decoder,    # <-- smaller LR for decoder
-            "weight_decay": 0.0,                    # <-- common choice: no WD on decoder
+            "weight_decay": self.hparams.weight_decay_decoder,
         }
 
         idm_params = {

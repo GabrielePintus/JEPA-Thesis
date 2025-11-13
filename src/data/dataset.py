@@ -173,6 +173,12 @@ class PointMazeSequences(Dataset):
             self.obs = (self.obs - obs_mean) / obs_std
             self.act = (self.act - act_mean) / act_std
 
+            # Save stats for later use
+            self.obs_mean = obs_mean
+            self.obs_std = obs_std
+            self.act_mean = act_mean
+            self.act_std = act_std
+
         self.E, self.T1, self.D = self.obs.shape
         self.T = self.T1 - 1
 

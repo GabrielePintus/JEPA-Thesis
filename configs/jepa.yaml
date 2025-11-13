@@ -1,50 +1,66 @@
-
-
 trainer:
-  max_epochs: 150
+  max_epochs: 100
   accelerator: gpu
   devices: 1
   num_nodes: 1
-  strategy: ddp_find_unused_parameters_true
+  strategy: ddp
   precision: bf16-mixed
   # gradient clipping
-  # gradient_clip_val: 1.0
-  # gradient_clip_algorithm: norm
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
   # gradient accumulation (accumulate gradients for N steps before optimizer step)
-  # accumulate_grad_batches: 2
-  # callbacks:
-  # - class_path: lightning.pytorch.callbacks.ModelCheckpoint
-  #   init_args:
-  #     dirpath: checkpoints/jepa
-  #     filename: "JEPA-{epoch:03d}-{val/loss:.4f}"
-  #     monitor: val/loss
-  #     mode: min
-  #     save_top_k: 1                        # best checkpoint
-  #     save_last: true                      # plus a copy of the final epoch
-  #     auto_insert_metric_name: false       # keep filename clean
-  #     every_n_epochs: 1
-  #     save_on_train_epoch_end: true
-  # logger:
-  #   class_path: lightning.pytorch.loggers.WandbLogger
-  #   init_args:
-  #     project: "JEPA"
-  #     name: "PointMaze/JEPA"
-  #     log_model: true
+  accumulate_grad_batches: 2
+  callbacks:
+  - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+    init_args:
+      dirpath: checkpoints/jepa
+      filename: "JEPA-{epoch:03d}-{val/loss:.4f}"
+      monitor: val/loss
+      mode: min
+      save_top_k: 1                        # best checkpoint
+      save_last: true                      # plus a copy of the final epoch
+      auto_insert_metric_name: false       # keep filename clean
+      every_n_epochs: 1
+      save_on_train_epoch_end: true
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: "JEPA"
+      name: "PointMaze/JEPA"
+      log_model: true
 
 
 model:
-  # encoder_weights: null
-  initial_lr: 5e-4
-  final_lr: 1e-6
-  warmup_steps: 2000
-  weight_decay: 1e-4
+  emb_dim: 32
+  depth: 3
+  heads: 4
+  mlp_dim: 64
+  proj_dim: 128
+  initial_lr_encoder:   1e-3
+  final_lr_encoder:     1e-5
+  weight_decay_encoder: 1e-3
+  initial_lr_decoder:   2e-3
+  final_lr_decoder:     5e-6
+  weight_decay_decoder: 1e-3
+  initial_lr_idm:       1e-3
+  final_lr_idm:         1e-5
+  weight_decay_idm:     1e-4
+  initial_lr_predictor: 1e-3
+  final_lr_predictor:   1e-5
+  weight_decay_predictor: 1e-4
+  warmup_steps: 1000
+  vc_global_coeff: 1.0
+  vc_patch_coeff: 1.0
+  vic_state_coeff: 1.0
+  compile: false
+  decoder_delay_steps: 0
 
 
 data:
-  data_path: data/train_trajectories_1000_100_4_64.npz
-  # seq_len: 50
+  data_path: data/train_trajectories_1000_100_4_64_largerdot.npz
   batch_size: 64
-  num_workers: 5
+  num_workers: 2
   pin_memory: true
   val_size: 0.1
-  epoch_fraction: 0.25
+  seq_len: 2
+  normalize: false

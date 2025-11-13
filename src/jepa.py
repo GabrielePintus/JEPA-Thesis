@@ -2,20 +2,21 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms
 import lightning as L
 from torch.optim.lr_scheduler import LambdaLR
-from vicreg_loss import VICRegLoss
-# from src.vicreg import VICRegLoss
-from src.focal_loss import FocalReconstructionLoss
 
+# from src.losses import TemporalVCRegLoss
+from src.losses import TemporalVCRegLossOptimized as TemporalVCRegLoss
 from src.components.encoder import VisualEncoder, ProprioEncoder, MLPProjection
 from src.components.decoder import VisualDecoder, ProprioDecoder, RegressionTransformerDecoder
+from src.components.predictor import TransformerDecoderPredictor, TransformerEncoderPredictor
 
 
 def focal_mse(pred, target, gamma=2):
     err = (pred - target)
     return ((err.abs() ** gamma) * (err ** 2))
+
+
 
 class JEPA(L.LightningModule):
     """
@@ -42,6 +43,9 @@ class JEPA(L.LightningModule):
         initial_lr_idm = 1e-3,
         final_lr_idm   = 1e-5,
         weight_decay_idm = 1e-5,
+        initial_lr_predictor = 1e-3,
+        final_lr_predictor   = 1e-5,
+        weight_decay_predictor = 1e-5,
         warmup_steps = 1000,
         vc_global_coeff = 1.0,
         vc_patch_coeff  = 0.5,
@@ -57,12 +61,30 @@ class JEPA(L.LightningModule):
         self.proprio_encoder    = ProprioEncoder(emb_dim=emb_dim)
         self.action_encoder     = ProprioEncoder(emb_dim=emb_dim, input_dim=2)
 
+        # Predictor
+        # self.predictor = TransformerDecoderPredictor(
+        #     emb_dim=emb_dim,
+        #     num_heads=4,
+        #     num_layers=2,
+        #     mlp_dim=128,
+        # )
+        self.predictor = TransformerEncoderPredictor(
+            emb_dim=emb_dim,
+            num_heads=4,
+            num_layers=2,
+            mlp_dim=128,
+            residual=False
+        )
+
         # Decoders
         self.visual_decoder  = VisualDecoder(
             emb_dim=emb_dim,
             patch_size=8,
         )
-        self.proprio_decoder = ProprioDecoder(emb_dim=emb_dim, hidden_dim=64)
+        self.proprio_decoder = ProprioDecoder(emb_dim=emb_dim, hidden_dim=64, output_dim=4)
+        self.action_decoder = ProprioDecoder(emb_dim=emb_dim, hidden_dim=64, output_dim=2)
+
+        # Inverse Dynamics Models
         self.idm_visual = nn.Sequential(
             nn.LayerNorm(emb_dim * 2),
             nn.Linear(emb_dim * 2, emb_dim),
@@ -75,7 +97,7 @@ class JEPA(L.LightningModule):
             nn.ReLU(),
             nn.Linear(emb_dim, emb_dim),
         )
-        self.state_from_patches_decoder = RegressionTransformerDecoder(
+        self.action_from_patches_decoder = RegressionTransformerDecoder(
             d_model=emb_dim,
             d_out=emb_dim,
             num_layers=1,
@@ -86,159 +108,254 @@ class JEPA(L.LightningModule):
 
         # Projections for VICReg
         self.proj_cls       = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
-        self.proj_patch     = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)  # applied per token
-        self.proj_cross_vis = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)  # CLS→proj
-        self.proj_cross_pos = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)  # PosToken→proj
-
-        # Compile all the networks
-        if compile:
-            self.visual_encoder     = torch.compile(self.visual_encoder)
-            self.proprio_encoder    = torch.compile(self.proprio_encoder)
-            self.action_encoder     = torch.compile(self.action_encoder)
-            self.proj_cls           = torch.compile(self.proj_cls)
-            self.proj_patch         = torch.compile(self.proj_patch)
-            self.proj_cross_vis     = torch.compile(self.proj_cross_vis)
-            self.proj_cross_pos     = torch.compile(self.proj_cross_pos)
-            self.visual_decoder     = torch.compile(self.visual_decoder)
-            self.proprio_decoder    = torch.compile(self.proprio_decoder)
-            self.idm_visual        = torch.compile(self.idm_visual)
-            self.idm_proprio       = torch.compile(self.idm_proprio)
-            self.state_from_patches_decoder = torch.compile(self.state_from_patches_decoder)
+        self.proj_state     = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
+        self.proj_patch     = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
+        self.proj_action    = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
+        self.proj_coherence_cls = MLPProjection(in_dim=emb_dim, proj_dim=proj_dim)
+        self.proj_coherence_patches = RegressionTransformerDecoder(
+            d_model=emb_dim,
+            d_out=proj_dim,
+            num_layers=1,
+            nhead=2,
+            dim_feedforward=64,
+            num_queries=1,
+        )
 
         # Losses
-        self.vicreg_loss = VICRegLoss()
-        # self.focal_loss = FocalReconstructionLoss(gamma=2.0, alpha=0.5)
+        self.tvcreg_loss = TemporalVCRegLoss()
 
-        self._decoder_delay_steps = decoder_delay_steps
-        self._global_step = 0
+        # Compile the networks
+        if compile:
+            self.visual_encoder = torch.compile(self.visual_encoder)
+            self.proprio_encoder = torch.compile(self.proprio_encoder)
+            self.action_encoder = torch.compile(self.action_encoder)
+            self.visual_decoder = torch.compile(self.visual_decoder)
+            self.proprio_decoder = torch.compile(self.proprio_decoder)
+            self.action_decoder = torch.compile(self.action_decoder)
+            self.idm_visual = torch.compile(self.idm_visual)
+            self.idm_proprio = torch.compile(self.idm_proprio)
+            self.action_from_patches_decoder = torch.compile(self.action_from_patches_decoder)
+            self.proj_cls = torch.compile(self.proj_cls)
+            self.proj_state = torch.compile(self.proj_state)
+            self.proj_patch = torch.compile(self.proj_patch)
+            self.proj_coherence_cls = torch.compile(self.proj_coherence_cls)
+            self.proj_coherence_patches = torch.compile(self.proj_coherence_patches)        
+            self.predictor = torch.compile(self.predictor)
+        
+
+
+    def encode_state_and_frame(self, state, frame):       
+        """
+        Encode a single state and frame.
+        
+        Args:
+            state: (B, state_dim)
+            frame: (B, 3, 64, 64)
+        """
+        z_state = self.proprio_encoder(state)
+        z_cls, z_patches, _ = self.visual_encoder(frame)
+        result = {
+            "z_state": z_state,
+            "z_cls": z_cls,
+            "z_patches": z_patches,
+        }
+        return result
+    
+    def predictor_step(self, z_cls, z_patches, z_state, z_action):
+        """
+        Predict next latent representations given current latents and action.
+        
+        Args:
+            z_cls:     (B, 1, D)
+            z_patches: (B, Np, D)
+            z_state:   (B, 1, D)
+            z_action:  (B, D)
+        Returns:
+            pred_cls:     (B, D)
+            pred_patches: (B, Np, D)
+            pred_state:   (B, D)
+        """
+        orig = torch.cat([z_cls, z_patches, z_state], dim=1)
+        pred_cls, pred_patches, pred_state = self.predictor(z_cls, z_patches, z_state, z_action)
+        pred_cls = orig[:, 0] + pred_cls
+        pred_patches = orig[:, 1:-1] + pred_patches
+        pred_state = orig[:, -1] + pred_state
+        return pred_cls, pred_patches, pred_state
 
     def shared_step(self, batch, batch_idx):
-        (state_curr, frame_curr), action, (state_next, frame_next), _ = batch
+        states, frames, actions = batch
+        # states:  (B, T+1, state_dim )
+        # frames:  (B, T+1, 3, 64, 64 )
+        # actions: (B, T  , action_dim)
 
-        # 1) Encode both views (vision branch)
-        cls_curr, patch_curr, _ = self.visual_encoder(frame_curr)      # (B, D), (B, N, D)
-        cls_next, patch_next, _ = self.visual_encoder(frame_next)      # (B, D), (B, N, D)
-        z_state_curr = self.proprio_encoder(state_curr)
-        z_state_next = self.proprio_encoder(state_next)
-        z_action = self.action_encoder(action)
+        B, T, _ = actions.shape
 
-        # Temporal VCReg losses on patches
-        patch_curr_proj = self.proj_patch(patch_curr).flatten(0, 1)
-        patch_next_proj = self.proj_patch(patch_next).flatten(0, 1)
-        vcreg_patch_curr = 15 * VICRegLoss.variance_loss(patch_curr_proj, 1.0) + VICRegLoss.covariance_loss(patch_curr_proj)
-        vcreg_patch_next = 15 * VICRegLoss.variance_loss(patch_next_proj, 1.0) + VICRegLoss.covariance_loss(patch_next_proj)
-        vcreg_patch = (vcreg_patch_curr + vcreg_patch_next) / 2.0
+        # Flatten over time
+        states_flatten  = states.flatten(0, 1)      # (B * T+1, state_dim)
+        frames_flatten  = frames.flatten(0, 1)      # (B * T+1, 3, 64, 64)
+        actions_flatten = actions.flatten(0, 1)     # (B * T, action_dim)
 
-        # Temporal VICReg loss on global CLS token
-        cls_curr_proj = self.proj_cls(cls_curr)  # (B, D)
-        cls_next_proj = self.proj_cls(cls_next)  # (B, D)
-        vcreg_cls_curr = 15 * VICRegLoss.variance_loss(cls_curr_proj, 1.0) + VICRegLoss.covariance_loss(cls_curr_proj)
-        vcreg_cls_next = 15 * VICRegLoss.variance_loss(cls_next_proj, 1.0) + VICRegLoss.covariance_loss(cls_next_proj)
-        vcreg_cls = (vcreg_cls_curr + vcreg_cls_next) / 2.0
+        # Encode
+        z_states_flatten = self.proprio_encoder(states_flatten)   # (B*T, D)
+        z_cls_flatten, z_patches_flatten, _ = self.visual_encoder(frames_flatten)  # (B*T, D), (B*T, N, D)
+        z_actions_flatten = self.action_encoder(actions_flatten)  # (B*T, D)
 
-        # Temporal VICReg loss on state tokens
-        z_state_curr_proj = self.proj_cross_pos(z_state_curr)
-        z_state_next_proj = self.proj_cross_pos(z_state_next)
-        vcreg_state_curr = 15 * VICRegLoss.variance_loss(z_state_curr_proj, 1.0) + VICRegLoss.covariance_loss(z_state_curr_proj)
-        vcreg_state_next = 15 * VICRegLoss.variance_loss(z_state_next_proj, 1.0) + VICRegLoss.covariance_loss(z_state_next_proj)
-        vcreg_state = (vcreg_state_curr + vcreg_state_next) / 2.0
+        # Reshape back to (B, T, D)
+        z_states  = z_states_flatten.view(B, T+1, -1)        # (B, T+1, D)
+        z_cls     = z_cls_flatten.view(B, T+1, -1)           # (B, T+1, D)
+        z_patches = z_patches_flatten.view(B, T+1, z_patches_flatten.shape[1], -1) # (B, T+1, N, D)
+        z_actions  = z_actions_flatten.view(B, T, -1)         # (B, T, D)
 
-        # Invariance between state and visual CLS tokens
-        z_cross_vis_curr = self.proj_cross_vis(cls_curr.detach())
-        z_cross_vis_next = self.proj_cross_vis(cls_next.detach())
-        vicreg_cross_curr = F.mse_loss(z_cross_vis_curr, z_state_curr_proj)
-        vicreg_cross_next = F.mse_loss(z_cross_vis_next, z_state_next_proj)
-        vicreg_cross = (vicreg_cross_curr + vicreg_cross_next) / 2.0
 
-        # Decode z_state_curr, z_state_next from visual patches
-        state_from_patches_curr = self.state_from_patches_decoder(patch_curr).squeeze(1)  # (B, D)
-        state_from_patches_next = self.state_from_patches_decoder(patch_next).squeeze(1)  # (B, D)
-        state_from_patches_loss_curr = F.mse_loss(state_from_patches_curr, z_state_curr)
-        state_from_patches_loss_next = F.mse_loss(state_from_patches_next, z_state_next)
-        state_from_patches_loss = (state_from_patches_loss_curr + state_from_patches_loss_next) / 2.0
+        #
+        #   Temporal VCReg
+        #
+        # the vcreg loss class automatically handles temporal dimension, meaning we can just pass in (B, T, D) or (B, T, N, D)
 
-        # Decode action from visual cls, proprio state and visual patches
-        idm_input_visual = torch.cat([cls_curr, cls_next], dim=-1)
-        idm_input_proprio = torch.cat([z_state_curr, z_state_next], dim=-1)
-        idm_input_patches = torch.cat([patch_curr, patch_next], dim=-2)
-        idm_pred_visual = self.idm_visual(idm_input_visual)
-        idm_pred_proprio = self.idm_proprio(idm_input_proprio)
-        idm_pred_patches = self.state_from_patches_decoder(idm_input_patches).squeeze(1)
-        idm_visual_loss = F.mse_loss(idm_pred_visual, z_action)
-        idm_proprio_loss = F.mse_loss(idm_pred_proprio, z_action)
-        idm_patches_loss = F.mse_loss(idm_pred_patches, z_action)
+        # Temporal VCReg on CLS
+        z_cls_proj = self.proj_cls(z_cls)
+        tvcreg_cls_loss = self.tvcreg_loss(z_cls_proj)
 
+        # Temporal VCReg on states
+        z_states_proj = self.proj_state(z_states)
+        tvcreg_states_loss = self.tvcreg_loss(z_states_proj)
+
+        # Temporal VCReg on patches
+        z_patches_proj = self.proj_patch(z_patches).permute(0, 2, 1, 3).flatten(0, 1)
+        tvcreg_patches_loss = self.tvcreg_loss(z_patches_proj)
+
+        # Temporal VCReg on actions
+        z_actions_proj = self.proj_action(z_actions)
+        tvcreg_actions_loss = self.tvcreg_loss(z_actions_proj)
+
+        # Combine losses
+        vcreg_loss = (
+            self.hparams.vc_global_coeff * tvcreg_cls_loss["loss"] +
+            self.hparams.vic_state_coeff * tvcreg_states_loss["loss"] +
+            self.hparams.vc_patch_coeff  * tvcreg_patches_loss["loss"] + 
+            1.0  * tvcreg_actions_loss["loss"]
+        )
+
+
+        #
+        #   Decode
+        #
+
+        # Decode state from z_state
+        states_recon_flatten = self.proprio_decoder(z_states_flatten.detach())   # (B*T, state_dim)
+        proprio_recon_loss = F.mse_loss(states_recon_flatten, states_flatten)
+
+        # Decode frames from z_patches
+        frames_recon_flatten = self.visual_decoder(z_patches_flatten.detach())  # (B*T, 3, 64, 64)
+        visual_recon_loss = F.mse_loss(frames_recon_flatten, frames_flatten)
+
+        # Decode actions from z_action
+        actions_recon_flatten = self.action_decoder(z_actions_flatten.detach())  # (B*T, action_dim)
+        action_recon_loss = F.mse_loss(actions_recon_flatten, actions_flatten)
+
+        # combine recon losses
+        recon_loss = proprio_recon_loss + visual_recon_loss + action_recon_loss
+
+        #
+        #   Inverse Dynamics Model
+        #   
+
+        # From visual CLS
+        z_cls_curr, z_cls_next = z_cls[:, :-1], z_cls[:, 1:]
+        idm_cls_in = torch.cat([z_cls_curr, z_cls_next], dim=-1)  # (B, T, D*2)
+        idm_cls_pred = self.idm_visual(idm_cls_in)  # (B, T, D)
+        idm_visual_loss = F.mse_loss(idm_cls_pred, z_actions)
+
+        # From proprio states
+        z_state_curr, z_state_next = z_states[:, :-1], z_states[:, 1:]
+        idm_state_in = torch.cat([z_state_curr, z_state_next], dim=-1)  # (B, T, D*2)
+        idm_state_pred = self.idm_proprio(idm_state_in)  # (B, T, D)    
+        idm_proprio_loss = F.mse_loss(idm_state_pred, z_actions)
+
+        # From visual patches
+        z_patches_curr, z_patches_next = z_patches[:, :-1], z_patches[:, 1:]  # (B, T, N, D)
+        z_patches_curr = z_patches_curr.flatten(0, 1)  # (B*T, N, D)
+        z_patches_next = z_patches_next.flatten(0, 1)  # (B*T, N, D)
+        idm_patches_in = torch.cat([z_patches_curr, z_patches_next], dim=-2)  # (B, T, N*2, D)
+        idm_patches_pred = self.action_from_patches_decoder(idm_patches_in)    # (B, T, D)
+        idm_patches_loss = F.mse_loss(idm_patches_pred, z_actions_flatten)
+
+        # Combine IDM losses
         idm_loss = (idm_visual_loss + idm_proprio_loss + idm_patches_loss) / 3.0
 
+        #
+        #   Coherence
+        #
+        state_proj = z_states_proj.flatten(0, 1)  # (B*T, D)
+        cls_proj = self.proj_coherence_cls(z_cls_flatten)  # (B*T, D)
+        patches_proj = self.proj_coherence_patches(z_patches_flatten)
 
-        # Visual reconstruction probe
-        frame_curr_recon = self.visual_decoder(patch_curr.detach())  # (B,3,64,64)
-        frame_next_recon = self.visual_decoder(patch_next.detach())  # (B,3,64,64)
-        # alpha = 0.9
-        # visual_recon_loss_curr = alpha * self.focal_loss(frame_curr_recon, frame_curr) + (1 - alpha) * F.mse_loss(frame_curr_recon, frame_curr)
-        # visual_recon_loss_next = alpha * self.focal_loss(frame_next_recon, frame_next) + (1 - alpha) * F.mse_loss(frame_next_recon, frame_next)
-        visual_recon_loss_curr = F.mse_loss(frame_curr_recon, frame_curr)
-        visual_recon_loss_next = F.mse_loss(frame_next_recon, frame_next)
-        visual_recon_loss = (visual_recon_loss_curr + visual_recon_loss_next) / 2.0
+        # State information in patches
+        patch_coherence_loss = F.mse_loss(state_proj, patches_proj)
 
+        # State information in CLS
+        cls_coherence_loss = F.mse_loss(state_proj, cls_proj)
 
-        # Proprio reconstruction probe
-        state_curr_recon = self.proprio_decoder(z_state_curr.detach())   # (B,4)
-        state_next_recon = self.proprio_decoder(z_state_next.detach())   # (B,4)
-        proprio_recon_loss_curr = F.mse_loss(state_curr_recon, state_curr)
-        proprio_recon_loss_next = F.mse_loss(state_next_recon, state_next)
-        proprio_recon_loss = (proprio_recon_loss_curr + proprio_recon_loss_next) / 2.0
-        
-        recon_loss_curr = visual_recon_loss_curr + proprio_recon_loss_curr
-        recon_loss_next = visual_recon_loss_next + proprio_recon_loss_next
-        recon_loss = (recon_loss_curr + recon_loss_next) / 2.0
+        cross_coherence_loss = (patch_coherence_loss + cls_coherence_loss) / 2.0
 
-        # Total loss
-        loss = (
-            recon_loss +
-            idm_loss +
-            self.hparams.vc_global_coeff * vcreg_cls +
-            self.hparams.vc_patch_coeff  * vcreg_patch +
-            self.hparams.vic_state_coeff  * vcreg_state +
-            vicreg_cross + state_from_patches_loss
+        #
+        #   Prediction
+        #
+        z_states_curr, z_states_next = z_states[:, :-1].flatten(0, 1), z_states[:, 1:].flatten(0, 1)
+        z_cls_curr, z_cls_next = z_cls[:, :-1].flatten(0, 1), z_cls[:, 1:].flatten(0, 1)
+        z_patches_curr, z_patches_next = z_patches[:, :-1].flatten(0, 1), z_patches[:, 1:].flatten(0, 1)
+        z_cls_next_pred, z_patches_next_pred, z_states_next_pred = self.predictor(
+            z_cls_curr.unsqueeze(1),
+            z_patches_curr,
+            z_states_curr.unsqueeze(1),
+            z_actions_flatten,
         )
+
+        # Prediction losses
+        # loss_pred_cls = F.mse_loss(z_cls_next_pred, z_cls_next.detach())
+        # loss_pred_patches = F.mse_loss(z_patches_next_pred, z_patches_next.detach())
+        # loss_pred_states = F.mse_loss(z_states_next_pred, z_states_next.detach())
+        loss_pred_cls = F.mse_loss(z_cls_next_pred, (z_cls_next - z_cls_curr).detach())
+        loss_pred_patches = F.mse_loss(z_patches_next_pred, (z_patches_next - z_patches_curr).detach())
+        loss_pred_states = F.mse_loss(z_states_next_pred, (z_states_next - z_states_curr).detach())
+
+        # Combine prediction losses
+        prediction_loss = (loss_pred_cls + loss_pred_patches + loss_pred_states) / 3.0
+
+
+
+
+        #
+        #   Total loss
+        #
+        loss = recon_loss + vcreg_loss + cross_coherence_loss + idm_loss + prediction_loss
 
         return {
             "loss": loss,
             "recon_loss": recon_loss,
-            # "recon_loss_curr": recon_loss_curr,
-            # "recon_loss_next": recon_loss_next,
             "proprio_recon_loss": proprio_recon_loss,
-            # "proprio_recon_loss_curr": proprio_recon_loss_curr,
-            # "proprio_recon_loss_next": proprio_recon_loss_next,
             "visual_recon_loss": visual_recon_loss,
-            # "visual_recon_loss_curr": visual_recon_loss_curr,
-            # "visual_recon_loss_next": visual_recon_loss_next,
+            "action_recon_loss": action_recon_loss,
             "idm_loss": idm_loss,       
             "idm_visual_loss": idm_visual_loss,
             "idm_proprio_loss": idm_proprio_loss,
             "idm_patches_loss": idm_patches_loss,
-            "vcreg_cls": vcreg_cls,
-            # "vcreg_cls_curr": vcreg_cls_curr,
-            # "vcreg_cls_next": vcreg_cls_next,
-            "vcreg_patch": vcreg_patch,
-            # "vcreg_patch_curr": vcreg_patch_curr,
-            # "vcreg_patch_next": vcreg_patch_next,
-            "vcreg_state": vcreg_state,
-            # "vcreg_state_curr": vcreg_state_curr,
-            # "vcreg_state_next": vcreg_state_next,
-            "vicreg_cross": vicreg_cross,
-            # "vicreg_cross_curr": vicreg_cross_curr,
-            # "vicreg_cross_next": vicreg_cross_next,
-            "state_from_patches_loss": state_from_patches_loss,
-            # "state_from_patches_loss_curr": state_from_patches_loss_curr,
-            # "state_from_patches_loss_next": state_from_patches_loss_next,
+            "vcreg_cls_loss": tvcreg_cls_loss["loss"],
+            "vcreg_state_loss": tvcreg_states_loss["loss"],
+            "vcreg_patch_loss": tvcreg_patches_loss["loss"],
+            "vcreg_action_loss": tvcreg_actions_loss["loss"],
+            "vcreg_loss": vcreg_loss,
+            "prediction_loss": prediction_loss,
+            "loss_pred_cls": loss_pred_cls,
+            "loss_pred_patches": loss_pred_patches,
+            "loss_pred_states": loss_pred_states,
+            "cross_coherence_loss": cross_coherence_loss,
         }
+    
 
     def training_step(self, batch, batch_idx):
         outs = self.shared_step(batch, batch_idx)
         self.log_dict({f"train/{k}": v for k, v in outs.items()}, prog_bar=True, sync_dist=True)
-        self._global_step += 1
         return outs["loss"]
     def validation_step(self, batch, batch_idx):
         outs = self.shared_step(batch, batch_idx)
@@ -254,30 +371,37 @@ class JEPA(L.LightningModule):
                     + list(self.proprio_encoder.parameters())
                     + list(self.action_encoder.parameters())
                     + list(self.proj_cls.parameters())
+                    + list(self.proj_state.parameters())
                     + list(self.proj_patch.parameters())
-                    + list(self.proj_cross_vis.parameters())
-                    + list(self.proj_cross_pos.parameters()),
+                    + list(self.proj_action.parameters())
+                    + list(self.proj_coherence_cls.parameters())
+                    + list(self.proj_coherence_patches.parameters()),
             "lr": self.hparams.initial_lr_encoder,          # encoder LR
             "weight_decay": self.hparams.weight_decay_encoder,
         }
-
         decoder_params = {
             "params": list(self.visual_decoder.parameters())
                     + list(self.proprio_decoder.parameters())
-                    + list(self.state_from_patches_decoder.parameters()),
+                    + list(self.action_decoder.parameters()),
             "lr": self.hparams.initial_lr_decoder,    # <-- smaller LR for decoder
-            "weight_decay": 0.0,                    # <-- common choice: no WD on decoder
+            "weight_decay": self.hparams.weight_decay_decoder,
         }
 
         idm_params = {
             "params": list(self.idm_visual.parameters())
-                    + list(self.idm_proprio.parameters()),
+                    + list(self.idm_proprio.parameters())
+                    + list(self.action_from_patches_decoder.parameters()),
             "lr": self.hparams.initial_lr_idm,          # same as encoder
             "weight_decay": self.hparams.weight_decay_idm,
         }
+        predictor_params = {
+            "params": list(self.predictor.parameters()),
+            "lr": self.hparams.initial_lr_predictor,
+            "weight_decay": self.hparams.weight_decay_predictor,
+        }
 
         optimizer = torch.optim.AdamW(
-            [encoder_params, decoder_params, idm_params],
+            [encoder_params, decoder_params, idm_params, predictor_params],
         )
 
         # ----------------------------
@@ -305,3 +429,389 @@ class JEPA(L.LightningModule):
                 "frequency": 1,
             },
         }
+
+
+
+    # ========================================
+    # Autoregressive Prediction Methods
+    # ========================================
+    def encode_initial_state(self, state, frame):
+        """
+        Encode a single initial state and frame.
+        
+        Args:
+            state: (B, state_dim) initial proprioceptive state
+            frame: (B, 3, 64, 64) initial frame
+            
+        Returns:
+            dict with:
+                - z_state: (B, D) encoded state
+                - z_cls: (B, D) encoded cls token
+                - z_patches: (B, N, D) encoded patches
+        """
+        z_state = self.proprio_encoder(state)
+        z_cls, z_patches, _ = self.visual_encoder(frame)
+        
+        return {
+            "z_state": z_state,
+            "z_cls": z_cls,
+            "z_patches": z_patches,
+        }
+    
+    def predict_next_latent(self, z_cls, z_patches, z_state, action):
+        """
+        Predict next latent representations given current latents and action.
+
+        Args:
+            z_cls:     (B, D) current cls token
+            z_patches: (B, N, D) current patches
+            z_state:   (B, D) current state
+            action:    (B, action_dim) action to take
+
+        Returns:
+            dict with predicted next latents:
+                - z_cls_next:     (B, D)
+                - z_patches_next: (B, N, D)
+                - z_state_next:   (B, D)
+        """
+        # Encode action
+        z_action = self.action_encoder(action)
+
+        # Predictor outputs *deltas* in latent space
+        delta_cls, delta_patches, delta_state = self.predictor(
+            z_cls.unsqueeze(1),   # (B, 1, D)
+            z_patches,            # (B, N, D)
+            z_state.unsqueeze(1), # (B, 1, D)
+            z_action,             # (B, D)
+        )
+
+        # Apply deltas to get next latents
+        z_cls_next     = z_cls     + delta_cls
+        z_patches_next = z_patches + delta_patches
+        z_state_next   = z_state   + delta_state
+
+        return {
+            "z_cls_next": z_cls_next,
+            "z_patches_next": z_patches_next,
+            "z_state_next": z_state_next,
+        }
+
+    
+    def predict_next_latents(self, current_latents, action):
+        """
+        Predict next latent representations given current latents dict and action.
+        """
+        if action.ndim == 3:
+            action = action.squeeze(1)
+
+        predicted = self.predict_next_latent(
+            current_latents["z_cls"],
+            current_latents["z_patches"],
+            current_latents["z_state"],
+            action,
+        )
+
+        return {
+            "z_cls": predicted["z_cls_next"],
+            "z_patches": predicted["z_patches_next"],
+            "z_state": predicted["z_state_next"],
+        }
+
+    
+    @torch.no_grad()
+    def decode_latents(self, z_cls, z_patches, z_state):
+        """
+        Decode latent representations back to observations.
+        
+        Args:
+            z_cls: (B, D) cls token
+            z_patches: (B, N, D) patches
+            z_state: (B, D) state
+            
+        Returns:
+            dict with:
+                - frame_recon: (B, 3, 64, 64) reconstructed frame
+                - state_recon: (B, state_dim) reconstructed state
+        """
+        frame_recon = self.visual_decoder(z_patches)
+        state_recon = self.proprio_decoder(z_state)
+        
+        return {
+            "frame_recon": frame_recon,
+            "state_recon": state_recon,
+        }
+    
+    def rollout_predictions(self, initial_state, initial_frame, actions, decode_every=1, debug=False, gt_states=None, gt_frames=None):
+        """
+        Perform autoregressive rollout in latent space with optional decoding.
+        
+        Args:
+            initial_state: (B, state_dim) initial proprioceptive state
+            initial_frame: (B, 3, 64, 64) initial frame
+            actions: (B, T, action_dim) sequence of actions
+            decode_every: decode every N steps (1 = decode all, 0 = decode none)
+            debug: if True, compute prediction losses at each step (requires gt_states and gt_frames)
+            gt_states: (B, T+1, state_dim) ground truth states for debug mode
+            gt_frames: (B, T+1, 3, 64, 64) ground truth frames for debug mode
+            
+        Returns:
+            dict with:
+                - latent_trajectory: list of dicts with z_cls, z_patches, z_state for each step
+                - decoded_frames: (B, T', 3, 64, 64) if decode_every > 0
+                - decoded_states: (B, T', state_dim) if decode_every > 0
+                - decode_indices: list of timestep indices that were decoded
+                - debug_losses: dict with losses at each decoded step if debug=True
+        """
+        B, T, _ = actions.shape
+
+        if debug:
+            if gt_states is None or gt_frames is None:
+                raise ValueError("debug=True requires gt_states and gt_frames to be provided")
+            if decode_every <= 0:
+                raise ValueError("debug=True requires decode_every > 0 to compute reconstruction losses")
+
+        # Encode initial state
+        latents = self.encode_initial_state(initial_state, initial_frame)
+        z_cls = latents["z_cls"]
+        z_patches = latents["z_patches"]
+        z_state = latents["z_state"]
+
+        latent_trajectory = []
+        decoded_frames, decoded_states, decode_indices = [], [], []
+
+        if debug:
+            debug_losses = {
+                "frame_recon_loss": [],
+                "state_recon_loss": [],
+                "total_recon_loss": [],
+                "pred_latent_cls_loss": [],
+                "pred_latent_patches_loss": [],
+                "pred_latent_state_loss": [],
+                "pred_latent_total_loss": [],
+                "timesteps": [],
+            }
+
+        # Store initial
+        latent_trajectory.append({
+            "z_cls": z_cls.clone(),
+            "z_patches": z_patches.clone(),
+            "z_state": z_state.clone(),
+        })
+
+        # Decode initial if requested
+        if decode_every > 0:
+            decoded = self.decode_latents(z_cls, z_patches, z_state)
+            decoded_frames.append(decoded["frame_recon"])
+            decoded_states.append(decoded["state_recon"])
+            decode_indices.append(0)
+
+            if debug:
+                frame_loss = F.mse_loss(decoded["frame_recon"], gt_frames[:, 0])
+                state_loss = F.mse_loss(decoded["state_recon"], gt_states[:, 0])
+                debug_losses["frame_recon_loss"].append(frame_loss.item())
+                debug_losses["state_recon_loss"].append(state_loss.item())
+                debug_losses["total_recon_loss"].append((frame_loss + state_loss).item())
+                debug_losses["timesteps"].append(0)
+
+        # Rollout
+        for t in range(T):
+            # Predict next latent
+            predicted = self.predict_next_latent(z_cls, z_patches, z_state, actions[:, t])
+            z_cls = predicted["z_cls_next"]
+            z_patches = predicted["z_patches_next"]
+            z_state = predicted["z_state_next"]
+
+            latent_trajectory.append({
+                "z_cls": z_cls.clone(),
+                "z_patches": z_patches.clone(),
+                "z_state": z_state.clone(),
+            })
+
+            # Decode if requested
+            if decode_every > 0 and (t + 1) % decode_every == 0:
+                decoded = self.decode_latents(z_cls, z_patches, z_state)
+                decoded_frames.append(decoded["frame_recon"])
+                decoded_states.append(decoded["state_recon"])
+                decode_indices.append(t + 1)
+
+                if debug:
+                    gt_idx = t + 1
+                    frame_loss = F.mse_loss(decoded["frame_recon"], gt_frames[:, gt_idx])
+                    state_loss = F.mse_loss(decoded["state_recon"], gt_states[:, gt_idx])
+                    debug_losses["frame_recon_loss"].append(frame_loss.item())
+                    debug_losses["state_recon_loss"].append(state_loss.item())
+                    debug_losses["total_recon_loss"].append((frame_loss + state_loss).item())
+
+                    # ---- Prediction latent error ----
+                    # Encode ground-truth next step
+                    with torch.no_grad():
+                        gt_latents = self.encode_initial_state(gt_states[:, gt_idx], gt_frames[:, gt_idx])
+                    z_cls_gt = gt_latents["z_cls"]
+                    z_patches_gt = gt_latents["z_patches"]
+                    z_state_gt = gt_latents["z_state"]
+
+                    pred_cls_loss = F.mse_loss(z_cls, z_cls_gt)
+                    pred_patches_loss = F.mse_loss(z_patches, z_patches_gt)
+                    pred_state_loss = F.mse_loss(z_state, z_state_gt)
+                    pred_total = (pred_cls_loss + pred_patches_loss + pred_state_loss).item() / 3.0
+
+                    debug_losses["pred_latent_cls_loss"].append(pred_cls_loss.item())
+                    debug_losses["pred_latent_patches_loss"].append(pred_patches_loss.item())
+                    debug_losses["pred_latent_state_loss"].append(pred_state_loss.item())
+                    debug_losses["pred_latent_total_loss"].append(pred_total)
+                    debug_losses["timesteps"].append(gt_idx)
+
+        result = {
+            "latent_trajectory": latent_trajectory,
+            "decode_indices": decode_indices,
+        }
+
+        if decoded_frames:
+            result["decoded_frames"] = torch.stack(decoded_frames, dim=1)
+            result["decoded_states"] = torch.stack(decoded_states, dim=1)
+
+        if debug:
+            result["debug_losses"] = debug_losses
+
+        return result
+
+    def rollout_predictions_from_latents(self, initial_latents, actions, decode_every=1, debug=False, gt_states=None, gt_frames=None):
+        """
+        Perform autoregressive rollout starting from latent representations (no initial encoding).
+        
+        This method is designed for efficient MPC replanning where you want to avoid
+        the encode-decode cycle. It takes latent states directly and rolls out predictions.
+        
+        Args:
+            initial_latents: dict with:
+                - z_cls: (B, D) initial cls token
+                - z_patches: (B, N, D) initial patches
+                - z_state: (B, D) initial state
+            actions: (B, T, action_dim) sequence of actions
+            decode_every: decode every N steps (1 = decode all, 0 = decode none)
+            debug: if True, compute prediction losses at each step (requires gt_states and gt_frames)
+            gt_states: (B, T+1, state_dim) ground truth states for debug mode
+            gt_frames: (B, T+1, 3, 64, 64) ground truth frames for debug mode
+            
+        Returns:
+            dict with:
+                - latent_trajectory: list of dicts with z_cls, z_patches, z_state for each step
+                - decoded_frames: (B, T', 3, 64, 64) if decode_every > 0
+                - decoded_states: (B, T', state_dim) if decode_every > 0
+                - decode_indices: list of timestep indices that were decoded
+                - debug_losses: dict with losses at each decoded step if debug=True
+        """
+        B, T, _ = actions.shape
+
+        if debug:
+            if gt_states is None or gt_frames is None:
+                raise ValueError("debug=True requires gt_states and gt_frames to be provided")
+            if decode_every <= 0:
+                raise ValueError("debug=True requires decode_every > 0 to compute reconstruction losses")
+
+        # Extract initial latents
+        z_cls = initial_latents["z_cls"]
+        z_patches = initial_latents["z_patches"]
+        z_state = initial_latents["z_state"]
+
+        latent_trajectory = []
+        decoded_frames, decoded_states, decode_indices = [], [], []
+
+        if debug:
+            debug_losses = {
+                "frame_recon_loss": [],
+                "state_recon_loss": [],
+                "total_recon_loss": [],
+                "pred_latent_cls_loss": [],
+                "pred_latent_patches_loss": [],
+                "pred_latent_state_loss": [],
+                "pred_latent_total_loss": [],
+                "timesteps": [],
+            }
+
+        # Store initial latents
+        latent_trajectory.append({
+            "z_cls": z_cls.clone(),
+            "z_patches": z_patches.clone(),
+            "z_state": z_state.clone(),
+        })
+
+        # Decode initial if requested
+        if decode_every > 0:
+            decoded = self.decode_latents(z_cls, z_patches, z_state)
+            decoded_frames.append(decoded["frame_recon"])
+            decoded_states.append(decoded["state_recon"])
+            decode_indices.append(0)
+
+            if debug:
+                frame_loss = F.mse_loss(decoded["frame_recon"], gt_frames[:, 0])
+                state_loss = F.mse_loss(decoded["state_recon"], gt_states[:, 0])
+                debug_losses["frame_recon_loss"].append(frame_loss.item())
+                debug_losses["state_recon_loss"].append(state_loss.item())
+                debug_losses["total_recon_loss"].append((frame_loss + state_loss).item())
+                debug_losses["timesteps"].append(0)
+
+        # Rollout
+        for t in range(T):
+            # Predict next latent
+            predicted = self.predict_next_latent(z_cls, z_patches, z_state, actions[:, t])
+            z_cls = predicted["z_cls_next"]
+            z_patches = predicted["z_patches_next"]
+            z_state = predicted["z_state_next"]
+
+            latent_trajectory.append({
+                "z_cls": z_cls.clone(),
+                "z_patches": z_patches.clone(),
+                "z_state": z_state.clone(),
+            })
+
+            # Decode if requested
+            if decode_every > 0 and (t + 1) % decode_every == 0:
+                decoded = self.decode_latents(z_cls, z_patches, z_state)
+                decoded_frames.append(decoded["frame_recon"])
+                decoded_states.append(decoded["state_recon"])
+                decode_indices.append(t + 1)
+
+                if debug:
+                    gt_idx = t + 1
+                    frame_loss = F.mse_loss(decoded["frame_recon"], gt_frames[:, gt_idx])
+                    state_loss = F.mse_loss(decoded["state_recon"], gt_states[:, gt_idx])
+                    debug_losses["frame_recon_loss"].append(frame_loss.item())
+                    debug_losses["state_recon_loss"].append(state_loss.item())
+                    debug_losses["total_recon_loss"].append((frame_loss + state_loss).item())
+
+                    # ---- Prediction latent error ----
+                    # Encode ground-truth next step
+                    with torch.no_grad():
+                        gt_latents = self.encode_initial_state(gt_states[:, gt_idx], gt_frames[:, gt_idx])
+                    z_cls_gt = gt_latents["z_cls"]
+                    z_patches_gt = gt_latents["z_patches"]
+                    z_state_gt = gt_latents["z_state"]
+
+                    pred_cls_loss = F.mse_loss(z_cls, z_cls_gt)
+                    pred_patches_loss = F.mse_loss(z_patches, z_patches_gt)
+                    pred_state_loss = F.mse_loss(z_state, z_state_gt)
+                    pred_total = (pred_cls_loss + pred_patches_loss + pred_state_loss).item() / 3.0
+
+                    debug_losses["pred_latent_cls_loss"].append(pred_cls_loss.item())
+                    debug_losses["pred_latent_patches_loss"].append(pred_patches_loss.item())
+                    debug_losses["pred_latent_state_loss"].append(pred_state_loss.item())
+                    debug_losses["pred_latent_total_loss"].append(pred_total)
+                    debug_losses["timesteps"].append(gt_idx)
+
+        result = {
+            "latent_trajectory": latent_trajectory,
+            "decode_indices": decode_indices,
+        }
+
+        if decoded_frames:
+            result["decoded_frames"] = torch.stack(decoded_frames, dim=1)
+            result["decoded_states"] = torch.stack(decoded_states, dim=1)
+
+        if debug:
+            result["debug_losses"] = debug_losses
+
+        return result
+
+
+
