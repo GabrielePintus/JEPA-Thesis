@@ -320,6 +320,18 @@ class ProprioEncoder(nn.Module):
         return self.net(xy)  # (B, D)
 
 
+class SimpleEncoder(nn.Module):
+    def __init__(self, input_dim=4, emb_dim=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.BatchNorm1d(input_dim),
+            nn.Linear(input_dim, emb_dim),
+        )
+    def forward(self, x): return self.net(x)  # (B, emb_dim)
+    def get_stats(self):
+        return self.net[0].running_mean, torch.sqrt(self.net[0].running_var)
+
+
 class RepeatEncoder(nn.Module):
     """Repeat the input to fill the embedding dimension."""
     def __init__(self, input_dim=4, emb_dim=128):

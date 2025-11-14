@@ -198,6 +198,94 @@ class CostFunction:
         return total_cost
 
 
+
+class TrajectoryCost:
+    """
+    Trajectory-level cost terms:
+      - soft distance to goal across all steps
+      - smoothness across consecutive latent states
+    """
+
+    def __init__(
+        self,
+        soft_goal_weight: float = 0.05,
+        smoothness_weight: float = 0.1,
+        distance_type: str = "mse",
+        use_cls: bool = True,
+        use_state: bool = True,
+        use_patches: bool = False,
+    ):
+        self.soft_goal_weight = soft_goal_weight
+        self.smoothness_weight = smoothness_weight
+        self.distance_type = distance_type
+
+        self.use_cls = use_cls
+        self.use_state = use_state
+        self.use_patches = use_patches
+
+    def _dist(self, a, b):
+        if self.distance_type == "mse":
+            return ((a - b) ** 2).mean(dim=-1)
+        elif self.distance_type == "mae":
+            return (a - b).abs().mean(dim=-1)
+        else:
+            raise ValueError("Unknown distance_type")
+
+    # -------------------------------------------------------
+    # Soft distance to goal at EVERY timestep
+    # -------------------------------------------------------
+    def soft_goal_term(self, traj_lat, goal_lat):
+        T = len(traj_lat["z_cls"])
+        cost = 0.0
+
+        for t in range(T):
+            if self.use_cls:
+                cost += self._dist(traj_lat["z_cls"][t], goal_lat["z_cls"])
+            if self.use_state:
+                cost += self._dist(traj_lat["z_state"][t], goal_lat["z_state"])
+            if self.use_patches:
+                # average over patches
+                p = self._dist(traj_lat["z_patches"][t], goal_lat["z_patches"])
+                if p.ndim > 1:
+                    p = p.mean(dim=-1)
+                cost += p
+
+        cost /= T
+
+        return self.soft_goal_weight * cost
+
+    # -------------------------------------------------------
+    # Smoothness: penalize z_{t+1} - z_t
+    # -------------------------------------------------------
+    def smoothness_term(self, traj_lat):
+        T = len(traj_lat["z_cls"])
+        cost = 0.0
+
+        for t in range(T - 1):
+            if self.use_cls:
+                cost += self._dist(traj_lat["z_cls"][t+1], traj_lat["z_cls"][t])
+            if self.use_state:
+                cost += self._dist(traj_lat["z_state"][t+1], traj_lat["z_state"][t])
+            if self.use_patches:
+                p = self._dist(traj_lat["z_patches"][t+1], traj_lat["z_patches"][t])
+                if p.ndim > 1:
+                    p = p.mean(dim=-1)
+                cost += p
+
+        return self.smoothness_weight * cost
+
+    # -------------------------------------------------------
+    def __call__(self, traj_lat, goal_lat):
+        return (
+            self.soft_goal_term(traj_lat, goal_lat)
+            + self.smoothness_term(traj_lat)
+        )
+
+
+
+
+
+
 # ============================================================================
 # Base Optimizer
 # ============================================================================
@@ -382,306 +470,6 @@ class GradientOptimizer(BaseOptimizer):
         }
         
         return best_actions, info
-
-
-
-class LamarckianCMAES:
-    """
-    Lamarckian CMA-ES: Interleaves CMA-ES with gradient-based refinement.
-    
-    Combines global evolutionary search with local gradient optimization
-    for faster convergence and better final solutions.
-    """
-    
-    def __init__(
-        self,
-        action_dim: int,
-        horizon: int,
-        population_size: Optional[int] = None,
-        sigma: float = 0.5,
-        action_bounds: Optional[Tuple[float, float]] = None,
-        device: str = "cpu",
-        # Lamarckian parameters
-        gradient_steps: int = 5,
-        gradient_lr: float = 0.01,
-        gradient_frequency: int = 1,
-        num_elite_to_refine: int = 1,
-    ):
-        self.action_dim = action_dim
-        self.horizon = horizon
-        self.device = torch.device(device)
-        self.action_bounds = action_bounds
-        
-        # Lamarckian parameters
-        self.gradient_steps = gradient_steps
-        self.gradient_lr = gradient_lr
-        self.gradient_frequency = gradient_frequency
-        self.num_elite_to_refine = num_elite_to_refine
-        
-        # Total dimension
-        self.N = action_dim * horizon
-        
-        # Population size
-        if population_size is None:
-            self.lambda_ = 4 + int(3 * math.log(self.N))
-        else:
-            self.lambda_ = population_size
-        
-        self.mu = self.lambda_ // 2
-        
-        # Recombination weights
-        weights = torch.log(torch.tensor(self.mu + 0.5)) - torch.log(torch.arange(1, self.mu + 1, dtype=torch.float32))
-        weights = weights / weights.sum()
-        self.weights = weights.to(self.device)
-        
-        self.mu_eff = 1.0 / (weights ** 2).sum().item()
-        
-        # CMA-ES parameters (same as FastCMAES)
-        self.sigma = sigma
-        self.c_sigma = (self.mu_eff + 2.0) / (self.N + self.mu_eff + 5.0)
-        self.d_sigma = 1.0 + 2.0 * max(0, math.sqrt((self.mu_eff - 1.0) / (self.N + 1.0)) - 1.0) + self.c_sigma
-        self.c_c = (4.0 + self.mu_eff / self.N) / (self.N + 4.0 + 2.0 * self.mu_eff / self.N)
-        alpha_mu = 2.0
-        self.c_1 = alpha_mu / ((self.N + 1.3) ** 2 + self.mu_eff)
-        self.c_mu = min(
-            1.0 - self.c_1,
-            alpha_mu * (self.mu_eff - 2.0 + 1.0 / self.mu_eff) / ((self.N + 2.0) ** 2 + alpha_mu * self.mu_eff / 2.0)
-        )
-        self.chi_N = math.sqrt(self.N) * (1.0 - 1.0 / (4.0 * self.N) + 1.0 / (21.0 * self.N ** 2))
-        self.eigen_update_interval = max(1, int(1.0 / (self.c_1 + self.c_mu) / self.N / 10.0))
-        
-        self.reset()
-    
-    def reset(self, initial_mean: Optional[torch.Tensor] = None):
-        """Reset optimizer state."""
-        if initial_mean is None:
-            self.mean = torch.zeros(self.N, device=self.device)
-        else:
-            self.mean = initial_mean.flatten().to(self.device)
-        
-        self.C = torch.eye(self.N, device=self.device)
-        self.B = torch.eye(self.N, device=self.device)
-        self.D = torch.ones(self.N, device=self.device)
-        self.p_sigma = torch.zeros(self.N, device=self.device)
-        self.p_c = torch.zeros(self.N, device=self.device)
-        
-        self.generation = 0
-        self.best_solution = self.mean.clone()
-        self.best_fitness = float('inf')
-        self.fitness_history = []
-    
-    def _sample_population(self) -> torch.Tensor:
-        """Sample population."""
-        z = torch.randn(self.lambda_, self.N, device=self.device)
-        y = z * self.D[None, :] @ self.B.T
-        population = self.mean[None, :] + self.sigma * y
-        
-        if self.action_bounds is not None:
-            population = torch.clamp(population, self.action_bounds[0], self.action_bounds[1])
-        
-        return population
-    
-    def _gradient_refinement(
-        self, 
-        solutions: torch.Tensor, 
-        fitness: torch.Tensor,
-        cost_fn: Callable
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Refine elite solutions using gradient descent."""
-        sorted_indices = torch.argsort(fitness)
-        elite_indices = sorted_indices[:self.num_elite_to_refine]
-        elite_solutions = solutions[elite_indices].clone()
-        
-        refined_solutions = []
-        refined_fitness = []
-        
-        for i in range(self.num_elite_to_refine):
-            solution = elite_solutions[i].clone().detach().requires_grad_(True)
-            
-            for step in range(self.gradient_steps):
-                solution_shaped = solution.view(1, self.horizon, self.action_dim)
-                
-                # Compute cost WITH gradients enabled
-                cost = cost_fn(solution_shaped)
-                
-                # Handle both scalar and tensor returns
-                if cost.dim() > 0:
-                    cost = cost.sum()
-                
-                # Check if gradient is possible
-                if not cost.requires_grad:
-                    # Cost function doesn't support gradients, skip refinement
-                    refined_solutions.append(solution.detach())
-                    refined_fitness.append(fitness[elite_indices[i]].item())
-                    break
-                
-                # Compute gradient
-                if solution.grad is not None:
-                    solution.grad.zero_()
-                
-                try:
-                    cost.backward()
-                except RuntimeError:
-                    # If backward fails, use current solution
-                    refined_solutions.append(solution.detach())
-                    refined_fitness.append(fitness[elite_indices[i]].item())
-                    break
-                
-                # Gradient descent step
-                with torch.no_grad():
-                    if solution.grad is not None:
-                        solution -= self.gradient_lr * solution.grad
-                    if self.action_bounds is not None:
-                        solution.clamp_(self.action_bounds[0], self.action_bounds[1])
-                
-                # Detach and re-enable gradients for next iteration
-                solution = solution.detach().requires_grad_(True)
-            else:
-                # All gradient steps completed successfully
-                with torch.no_grad():
-                    solution_shaped = solution.view(1, self.horizon, self.action_dim)
-                    final_cost = cost_fn(solution_shaped)
-                    if final_cost.dim() > 0:
-                        final_cost = final_cost[0]
-                    refined_solutions.append(solution.detach())
-                    refined_fitness.append(final_cost.item())
-        
-        refined_solutions = torch.stack(refined_solutions)
-        refined_fitness = torch.tensor(refined_fitness, device=self.device)
-        
-        return refined_solutions, refined_fitness
-    
-    def _update_distribution(self, population: torch.Tensor, fitness: torch.Tensor):
-        """Update distribution (same as FastCMAES)."""
-        sorted_indices = torch.argsort(fitness)
-        sorted_population = population[sorted_indices]
-        
-        if fitness[sorted_indices[0]] < self.best_fitness:
-            self.best_fitness = fitness[sorted_indices[0]].item()
-            self.best_solution = sorted_population[0].clone()
-        
-        selected = sorted_population[:self.mu]
-        old_mean = self.mean.clone()
-        self.mean = (self.weights[:, None] * selected).sum(dim=0)
-        
-        mean_shift = (self.mean - old_mean) / self.sigma
-        C_inv_half_shift = mean_shift @ self.B / self.D @ self.B.T
-        self.p_sigma = (1.0 - self.c_sigma) * self.p_sigma + \
-                       math.sqrt(self.c_sigma * (2.0 - self.c_sigma) * self.mu_eff) * C_inv_half_shift
-        
-        norm_p_sigma = torch.norm(self.p_sigma).item()
-        self.sigma *= math.exp((self.c_sigma / self.d_sigma) * (norm_p_sigma / self.chi_N - 1.0))
-        
-        left_side = norm_p_sigma / math.sqrt(1.0 - (1.0 - self.c_sigma) ** (2.0 * (self.generation + 1)))
-        right_side = (1.4 + 2.0 / (self.N + 1.0)) * self.chi_N
-        h_sigma = 1.0 if left_side < right_side else 0.0
-        
-        self.p_c = (1.0 - self.c_c) * self.p_c + \
-                   h_sigma * math.sqrt(self.c_c * (2.0 - self.c_c) * self.mu_eff) * mean_shift
-        
-        delta_h_sigma = (1.0 - h_sigma) * self.c_c * (2.0 - self.c_c)
-        rank_one = torch.outer(self.p_c, self.p_c)
-        
-        steps = (selected - old_mean[None, :]) / self.sigma
-        weighted_steps = steps * self.weights[:, None].sqrt()
-        rank_mu = weighted_steps.T @ weighted_steps
-        
-        self.C = (1.0 - self.c_1 - self.c_mu + delta_h_sigma) * self.C + \
-                 self.c_1 * rank_one + self.c_mu * rank_mu
-        
-        if self.generation % self.eigen_update_interval == 0:
-            self.C = (self.C + self.C.T) / 2.0
-            eigenvalues, eigenvectors = torch.linalg.eigh(self.C)
-            eigenvalues = torch.clamp(eigenvalues, min=1e-10)
-            self.D = torch.sqrt(eigenvalues)
-            self.B = eigenvectors
-        
-        self.generation += 1
-    
-    def optimize(
-        self,
-        cost_fn: Callable,
-        initial_actions: Optional[torch.Tensor] = None,
-        num_iterations: int = 100,
-        verbose: bool = False,
-    ) -> Tuple[torch.Tensor, Dict]:
-        """Run Lamarckian CMA-ES optimization."""
-        if initial_actions is not None:
-            self.reset(initial_actions)
-        else:
-            self.reset()
-        
-        cost_history = []
-        gradient_improvements = []
-        
-        # Test if cost function supports gradients
-        supports_gradients = True
-        try:
-            test_action = torch.randn(1, self.horizon, self.action_dim, device=self.device, requires_grad=True)
-            test_cost = cost_fn(test_action)
-            if test_cost.dim() > 0:
-                test_cost = test_cost.sum()
-            if test_cost.requires_grad:
-                test_cost.backward()
-            else:
-                supports_gradients = False
-        except:
-            supports_gradients = False
-        
-        if not supports_gradients and self.gradient_steps > 0:
-            if verbose:
-                print("Warning: Cost function doesn't support gradients. Falling back to pure CMA-ES.")
-        
-        for gen in range(num_iterations):
-            # Sample and evaluate
-            population = self._sample_population()
-            population_shaped = population.view(self.lambda_, self.horizon, self.action_dim)
-            
-            with torch.no_grad():
-                fitness = cost_fn(population_shaped)
-            
-            # Gradient refinement (only if supported)
-            if supports_gradients and gen % self.gradient_frequency == 0 and self.gradient_steps > 0:
-                refined_solutions, refined_fitness = self._gradient_refinement(
-                    population, fitness, cost_fn
-                )
-                
-                original_elite_fitness = fitness[torch.argsort(fitness)[:self.num_elite_to_refine]]
-                improvement = (original_elite_fitness - refined_fitness).mean().item()
-                gradient_improvements.append(improvement)
-                
-                # Inject refined solutions
-                sorted_indices = torch.argsort(fitness, descending=True)
-                worst_indices = sorted_indices[:self.num_elite_to_refine]
-                population[worst_indices] = refined_solutions
-                fitness[worst_indices] = refined_fitness
-            
-            # Update distribution
-            self._update_distribution(population, fitness)
-            
-            best_gen_cost = fitness.min().item()
-            cost_history.append(best_gen_cost)
-            self.fitness_history.append(best_gen_cost)
-            
-            if verbose and (gen % 10 == 0 or gen == num_iterations - 1):
-                grad_info = f", GradImp={gradient_improvements[-1]:.6f}" if gradient_improvements else ""
-                print(f"Gen {gen:3d}: Best={best_gen_cost:.6f}, Sigma={self.sigma:.4f}{grad_info}")
-        
-        best_actions = self.best_solution.view(1, self.horizon, self.action_dim)
-        
-        info = {
-            "cost_history": cost_history,
-            "best_cost": self.best_fitness,
-            "final_cost": cost_history[-1],
-            "num_iterations": num_iterations,
-            "num_evaluations": num_iterations * self.lambda_,
-            "gradient_improvements": gradient_improvements,
-            "used_gradients": supports_gradients and self.gradient_steps > 0,
-        }
-        
-        return best_actions, info
-
-
 
 
 
@@ -1091,144 +879,6 @@ class CMAESOptimizer:
         self.best_solution = state_dict['best_solution'].to(self.device)
         self.best_fitness = state_dict['best_fitness']
         self.fitness_history = state_dict['fitness_history']
-
-
-
-
-
-# class CMAESOptimizer(BaseOptimizer):
-#     """
-#     Covariance Matrix Adaptation Evolution Strategy (CMA-ES).
-    
-#     A sampling-based black-box optimization algorithm.
-#     Requires: pip install cma
-#     """
-    
-#     def __init__(
-#         self,
-#         action_dim: int,
-#         horizon: int,
-#         population_size: Optional[int] = None,
-#         sigma: float = 0.5,
-#         action_bounds: Optional[Tuple[float, float]] = None,
-#         device: str = "cpu",
-#     ):
-#         """
-#         Args:
-#             population_size: Number of samples per iteration (default: 4 + 3*log(dim))
-#             sigma: Initial standard deviation
-#             action_bounds: (min, max) bounds for actions
-#         """
-#         super().__init__(action_dim, horizon, device)
-        
-#         try:
-#             import cma
-#             self.cma = cma
-#         except ImportError:
-#             raise ImportError("CMA-ES requires: pip install cma")
-        
-#         self.population_size = population_size
-#         self.sigma = sigma
-#         self.action_bounds = action_bounds
-        
-#         self.es = None
-    
-#     def reset(self):
-#         """Reset optimizer state."""
-#         self.es = None
-    
-#     def optimize(
-#         self,
-#         cost_fn: Callable,
-#         initial_actions: Optional[torch.Tensor] = None,
-#         num_iterations: int = 100,
-#         verbose: bool = False,
-#     ) -> Tuple[torch.Tensor, Dict]:
-#         """
-#         Optimize using CMA-ES.
-        
-#         Args:
-#             cost_fn: Function that takes actions (B, T, action_dim) -> (B,) costs
-#             initial_actions: Initial mean (1, T, action_dim)
-#             num_iterations: Number of CMA-ES generations
-#             verbose: Print progress
-            
-#         Returns:
-#             best_actions: (1, T, action_dim) optimized actions
-#             info: Dict with optimization info
-#         """
-#         # Flatten action dimensions
-#         total_dim = self.horizon * self.action_dim
-        
-#         # Initialize
-#         if initial_actions is None:
-#             x0 = np.zeros(total_dim)
-#         else:
-#             x0 = initial_actions.cpu().numpy().flatten()
-        
-#         # Setup CMA-ES options
-#         opts = {
-#             'popsize': self.population_size,
-#             'verbose': -1 if not verbose else 1,
-#         }
-        
-#         if self.action_bounds is not None:
-#             opts['bounds'] = [self.action_bounds[0], self.action_bounds[1]]
-        
-#         # Initialize CMA-ES
-#         self.es = self.cma.CMAEvolutionStrategy(x0, self.sigma, opts)
-        
-#         # Optimization loop
-#         cost_history = []
-        
-#         for iteration in range(num_iterations):
-#             # Sample population
-#             solutions = self.es.ask()
-            
-#             # Evaluate solutions
-#             costs = []
-#             for sol in solutions:
-#                 # Reshape to (1, T, action_dim)
-#                 actions = torch.tensor(
-#                     sol.reshape(1, self.horizon, self.action_dim),
-#                     dtype=torch.float32,
-#                     device=self.device
-#                 )
-                
-#                 # Compute cost
-#                 with torch.no_grad():
-#                     cost = cost_fn(actions).item()
-#                 costs.append(cost)
-            
-#             # Update CMA-ES
-#             self.es.tell(solutions, costs)
-            
-#             # Track best
-#             best_cost = min(costs)
-#             cost_history.append(best_cost)
-            
-#             if verbose and (iteration % 10 == 0 or iteration == num_iterations - 1):
-#                 print(f"Generation {iteration}: best cost = {best_cost:.6f}, sigma = {self.es.sigma:.4f}")
-        
-#         # Get best solution
-#         best_solution = self.es.result.xbest
-#         best_actions = torch.tensor(
-#             best_solution.reshape(1, self.horizon, self.action_dim),
-#             dtype=torch.float32,
-#             device=self.device
-#         )
-        
-#         info = {
-#             "cost_history": cost_history,
-#             "best_cost": self.es.result.fbest,
-#             "num_iterations": num_iterations,
-#             "num_evaluations": self.es.result.evaluations,
-#         }
-        
-#         return best_actions, info
-
-
-
 
 
 
@@ -1719,7 +1369,8 @@ class LatentSpacePlanner:
         self,
         jepa_model,
         cost_function: CostFunction,
-        optimizer: BaseOptimizer,
+        trajectory_cost_function: Optional[CostFunction] = None,
+        optimizer: Optional[BaseOptimizer] = None,
         device: str = "cpu",
         action_repeat: int = 1,
     ):
@@ -1736,6 +1387,7 @@ class LatentSpacePlanner:
         self.model = jepa_model
         self.model.eval()
         self.cost_fn = cost_function
+        self.trajectory_cost_fn = trajectory_cost_function
         self.optimizer = optimizer
         self.device = device
         self.action_repeat = action_repeat
@@ -1892,9 +1544,19 @@ class LatentSpacePlanner:
             
             # Get final predicted latents
             final_latents = rollout_result["latent_trajectory"][-1]
+            rollout_result_cat = {
+                'z_cls': [latents['z_cls'] for latents in rollout_result["latent_trajectory"]],
+                'z_patches': [latents['z_patches'] for latents in rollout_result["latent_trajectory"]],
+                'z_state': [latents['z_state'] for latents in rollout_result["latent_trajectory"]],
+            }
             
             # Compute cost in latent space
-            costs = self.cost_fn(final_latents, goal_latents_batch)
+            goal_cost = self.cost_fn(final_latents, goal_latents_batch)
+            trajectory_cost = 0.0
+            if self.trajectory_cost_fn is not None:
+                trajectory_cost = self.trajectory_cost_fn(rollout_result_cat, goal_latents_batch)
+
+            costs = goal_cost + trajectory_cost  # (B,)
             
             return costs
         

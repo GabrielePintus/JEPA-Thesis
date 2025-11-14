@@ -7,7 +7,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 # from src.losses import TemporalVCRegLoss
 from src.losses import TemporalVCRegLossOptimized as TemporalVCRegLoss
-from src.components.encoder import RepeatEncoder, VisualEncoder, ProprioEncoder, MLPProjection
+from src.components.encoder import RepeatEncoder, SimpleEncoder, VisualEncoder, ProprioEncoder, MLPProjection
 from src.components.decoder import VisualDecoder, ProprioDecoder, RegressionTransformerDecoder
 from src.components.predictor import EncoderDecoderPredictor, TransformerDecoderPredictor, TransformerEncoderPredictor
 
@@ -53,21 +53,15 @@ class JEPA(L.LightningModule):
 
         # Encoders
         self.visual_encoder     = VisualEncoder(emb_dim=emb_dim, depth=depth, heads=heads, mlp_dim=mlp_dim, patch_size=8)
-        self.proprio_encoder    = nn.Sequential(
-            nn.BatchNorm1d(4),
-            nn.Linear(4, emb_dim),
-        )
-        self.action_encoder     = nn.Sequential(
-            nn.BatchNorm1d(2),
-            nn.Linear(2, emb_dim),
-        )
-
+        self.proprio_encoder    = SimpleEncoder(input_dim=4, emb_dim=emb_dim)
+        self.action_encoder = SimpleEncoder(input_dim=2, emb_dim=emb_dim)
+        
         # Predictor
         self.predictor = EncoderDecoderPredictor(
             emb_dim=emb_dim,
             num_heads=4,
-            num_encoder_layers=2,
-            num_decoder_layers=4,
+            num_encoder_layers=3,
+            num_decoder_layers=0,
             mlp_dim=128,
             residual=False
         )
@@ -171,11 +165,7 @@ class JEPA(L.LightningModule):
             pred_patches: (B, Np, D)
             pred_state:   (B, D)
         """
-        orig = torch.cat([z_cls, z_patches, z_state], dim=1)
         pred_cls, pred_patches, pred_state = self.predictor(z_cls, z_patches, z_state, z_action)
-        # pred_cls = orig[:, 0] + pred_cls
-        # pred_patches = orig[:, 1:-1] + pred_patches
-        # pred_state = orig[:, -1] + pred_state
         return pred_cls, pred_patches, pred_state
 
     def shared_step(self, batch, batch_idx):
@@ -238,7 +228,10 @@ class JEPA(L.LightningModule):
         #
 
         # Decode state from z_state
-        states_recon_flatten = self.proprio_decoder(z_states_flatten.detach())   # (B*T, state_dim)
+        states_recon_flatten = self.proprio_decoder(
+            z_states_flatten.detach(),
+            *self.proprio_encoder.get_stats()
+        )   # (B*T, state_dim)
         proprio_recon_loss = F.mse_loss(states_recon_flatten, states_flatten)
 
         # Decode frames from z_patches
@@ -246,7 +239,10 @@ class JEPA(L.LightningModule):
         visual_recon_loss = F.mse_loss(frames_recon_flatten, frames_flatten)
 
         # Decode actions from z_action
-        actions_recon_flatten = self.action_decoder(z_actions_flatten.detach())  # (B*T, action_dim)
+        actions_recon_flatten = self.action_decoder(
+            z_actions_flatten.detach(),
+            *self.action_encoder.get_stats()
+        )  # (B*T, action_dim)
         action_recon_loss = F.mse_loss(actions_recon_flatten, actions_flatten)
 
         # combine recon losses
@@ -315,45 +311,64 @@ class JEPA(L.LightningModule):
         # Combine prediction losses
         prediction_loss_1 = (loss_pred_cls + loss_pred_patches + loss_pred_states) / 3.0
 
-        # 2-step prediction
-        # First, we need to get the states, cls, and patches for t+2
-        z_cls_pred_step1 = z_cls_next_pred[:-B]  # (B*(T-1), D)
-        z_patches_pred_step1 = z_patches_next_pred[:-B]  # (B*(T-1), N, D)
-        z_states_pred_step1 = z_states_next_pred[:-B]  # (B*(T-1), D)
+        # Variance loss stacking on time the previous and predicted steps
+        tvcreg_states_pred_in = torch.stack([z_states_curr, z_states_next_pred], dim=1)
+        tvcreg_cls_pred_in = torch.stack([z_cls_curr, z_cls_next_pred], dim=1)
+        tvcreg_patches_pred_in = torch.stack([z_patches_curr, z_patches_next_pred], dim=1).permute(0, 2, 1, 3).flatten(0, 1)
+        tvcreg_states_pred_loss = self.tvcreg_loss(self.proj_state(tvcreg_states_pred_in))['loss']
+        tvcreg_cls_pred_loss = self.tvcreg_loss(self.proj_cls(tvcreg_cls_pred_in))['loss']
+        tvcreg_patches_pred_loss = self.tvcreg_loss(self.proj_patch(tvcreg_patches_pred_in))['loss']
+        tvcreg_pred_loss = (tvcreg_states_pred_loss + tvcreg_cls_pred_loss + tvcreg_patches_pred_loss) / 3.0
 
-        # Actions at t+1 (skip first action, these are actions that follow our predictions)
-        z_actions_step2 = z_actions_flatten[B:]  # (B*(T-1), D)
 
-        # Ground truth at t+2
-        z_states_next_2 = z_states[:, 2:].flatten(0, 1)  # (B*(T-1), D)
-        z_cls_next_2 = z_cls[:, 2:].flatten(0, 1)  # (B*(T-1), D)
-        z_patches_next_2 = z_patches[:, 2:].flatten(0, 1)  # (B*(T-1), N, D)
+        # Smoothing 
+        smoothing_loss_states = F.mse_loss(z_states_next, z_states_curr)
+        smoothing_loss_cls = F.mse_loss(z_cls_next, z_cls_curr)
+        smoothing_loss_patches = F.mse_loss(z_patches_next, z_patches_curr)
+        smoothing_loss = (smoothing_loss_states + smoothing_loss_cls + smoothing_loss_patches) / 3.0
 
-        # Step 2: Predict t+2 from predicted t+1 using action at t+1 (autoregressive, no teacher forcing)
-        z_cls_next_pred_2, z_patches_next_pred_2, z_states_next_pred_2 = self.predictor(
-            z_cls_pred_step1.unsqueeze(1),
-            z_patches_pred_step1,
-            z_states_pred_step1.unsqueeze(1),
-            z_actions_step2,
-        )
-        # Prediction losses
-        loss_pred_cls_2       = F.mse_loss(z_cls_next_pred_2, z_cls_next_2)
-        loss_pred_patches_2   = F.mse_loss(z_patches_next_pred_2, z_patches_next_2)
-        loss_pred_states_2    = F.mse_loss(z_states_next_pred_2, z_states_next_2)
 
-        # Combine prediction losses
-        prediction_loss_2 = (loss_pred_cls_2 + loss_pred_patches_2 + loss_pred_states_2) / 3.0
+
+        # # 2-step prediction
+        # # First, we need to get the states, cls, and patches for t+2
+        # z_cls_pred_step1 = z_cls_next_pred[:-B]  # (B*(T-1), D)
+        # z_patches_pred_step1 = z_patches_next_pred[:-B]  # (B*(T-1), N, D)
+        # z_states_pred_step1 = z_states_next_pred[:-B]  # (B*(T-1), D)
+
+        # # Actions at t+1 (skip first action, these are actions that follow our predictions)
+        # z_actions_step2 = z_actions_flatten[B:]  # (B*(T-1), D)
+
+        # # Ground truth at t+2
+        # z_states_next_2 = z_states[:, 2:].flatten(0, 1)  # (B*(T-1), D)
+        # z_cls_next_2 = z_cls[:, 2:].flatten(0, 1)  # (B*(T-1), D)
+        # z_patches_next_2 = z_patches[:, 2:].flatten(0, 1)  # (B*(T-1), N, D)
+
+        # # Step 2: Predict t+2 from predicted t+1 using action at t+1 (autoregressive, no teacher forcing)
+        # z_cls_next_pred_2, z_patches_next_pred_2, z_states_next_pred_2 = self.predictor(
+        #     z_cls_pred_step1.unsqueeze(1),
+        #     z_patches_pred_step1,
+        #     z_states_pred_step1.unsqueeze(1),
+        #     z_actions_step2,
+        # )
+        # # Prediction losses
+        # loss_pred_cls_2       = F.mse_loss(z_cls_next_pred_2, z_cls_next_2)
+        # loss_pred_patches_2   = F.mse_loss(z_patches_next_pred_2, z_patches_next_2)
+        # loss_pred_states_2    = F.mse_loss(z_states_next_pred_2, z_states_next_2)
+
+        # # Combine prediction losses
+        # prediction_loss_2 = (loss_pred_cls_2 + loss_pred_patches_2 + loss_pred_states_2) / 3.0
 
         # Weighted sum
-        prediction_loss = prediction_loss_1 + self.hparams.autoregressive_loss_decay * prediction_loss_2
-        prediction_loss = prediction_loss / (1.0 + self.hparams.autoregressive_loss_decay)
+        # prediction_loss = prediction_loss_1 + self.hparams.autoregressive_loss_decay * prediction_loss_2
+        # prediction_loss = prediction_loss / (1.0 + self.hparams.autoregressive_loss_decay)
+        prediction_loss = prediction_loss_1
         
 
 
         #
         #   Total loss
         #
-        loss = recon_loss + vcreg_loss + cross_coherence_loss + idm_loss + prediction_loss
+        loss = recon_loss + vcreg_loss + cross_coherence_loss + idm_loss + prediction_loss + tvcreg_pred_loss + 0.1 * smoothing_loss
 
         return {
             "loss": loss,
@@ -372,11 +387,16 @@ class JEPA(L.LightningModule):
             "vcreg_loss": vcreg_loss,
             "prediction_loss": prediction_loss,
             "prediction_loss_1": prediction_loss_1,
-            "prediction_loss_2": prediction_loss_2,
+            # "prediction_loss_2": prediction_loss_2,
+            "smoothing_loss": smoothing_loss,
             "loss_pred_cls": loss_pred_cls,
             "loss_pred_patches": loss_pred_patches,
             "loss_pred_states": loss_pred_states,
             "cross_coherence_loss": cross_coherence_loss,
+            "tvcreg_pred_loss": tvcreg_pred_loss,
+            "tvcreg_states_pred_loss": tvcreg_states_pred_loss,
+            "tvcreg_cls_pred_loss": tvcreg_cls_pred_loss,
+            "tvcreg_patches_pred_loss": tvcreg_patches_pred_loss,
         }
     
 

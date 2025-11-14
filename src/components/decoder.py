@@ -3,6 +3,136 @@ import torch.nn as nn
 
 
 
+class ResUpBlock(nn.Module):
+    """
+    Residual upsampling block:
+        x → upsample → conv → conv → residual add
+    """
+    def __init__(self, in_ch, out_ch, scale_factor=2):
+        super().__init__()
+        self.scale = scale_factor
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        self.proj  = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x):
+        # Upsample
+        x_up = F.interpolate(x, scale_factor=self.scale, mode="bilinear", align_corners=False)
+
+        # Residual block
+        y = F.gelu(self.conv1(x_up))
+        y = self.conv2(y)
+        return F.gelu(y + self.proj(x_up))  # skip connection
+        
+
+class MeNet6DecoderStrong(nn.Module):
+    """
+    Stronger, smoother, high-capacity decoder for MeNet6.
+    Input:  (B,16,26,26)
+    Output: (B,3,64,64)
+    """
+    def __init__(self, out_channels=3):
+        super().__init__()
+
+        # First expand channels BEFORE upsampling
+        self.pre = nn.Sequential(
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.GELU(),
+        )
+
+        # Upsample 26 → 52 (approx original 28→60)
+        self.up1 = ResUpBlock(32, 32, scale_factor=2)
+
+        # Slight refine at 52×52
+        self.refine1 = nn.Sequential(
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.GELU(),
+        )
+
+        # Upsample 52 → 64
+        self.up2 = ResUpBlock(32, 16, scale_factor=64/52)  # ≈1.23 upscale
+
+        # Final refinement
+        self.refine2 = nn.Sequential(
+            nn.Conv2d(16, 16, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, out_channels, 3, padding=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z):
+        """
+        z: (B,16,26,26)
+        """
+        x = self.pre(z)                # → (B,32,26,26)
+        x = self.up1(x)                # → (B,32,52,52)
+        x = self.refine1(x)            # refine
+        x = self.up2(x)                # → (B,16,64,64)
+        x = self.refine2(x)            # → (B,3,64,64)
+        return x
+
+
+
+class MeNet6Decoder(nn.Module):
+    """
+    Approximate inverse of MeNet6.
+    Takes latent feature map (B,16,26,26) and reconstructs (B,3,64,64).
+
+    This is ONLY for visualization — it does not need to be a perfect inverse.
+    """
+
+    def __init__(self, out_channels=3):
+        super().__init__()
+
+        # 1) Reverse last Conv1x1 (16 → 32)
+        self.up1 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+
+        # 2) Reverse stride-1 Conv3x3 (32 → 32)
+        self.up2 = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+
+        # 3) Reverse stride-2 Conv5x5 (32 → 16), using ConvTranspose2D
+        # Original reduced 60→28; we restore 28→60
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose2d(32, 16, kernel_size=5, stride=2, padding=1, output_padding=1),
+            nn.GELU(),
+        )
+
+        # 4) Reverse first Conv5x5 (16 → out_channels), restore 60→64
+        self.up4 = nn.Sequential(
+            nn.ConvTranspose2d(16, out_channels, kernel_size=5, stride=1),
+        )
+
+        self.refine = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels*2, kernel_size=3, padding=1),
+            nn.Conv2d(out_channels*2, out_channels, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, z):
+        """
+        z: latent feature map of shape (B,16,26,26)
+        returns: reconstructed frame (B,out_channels,64,64)
+        """
+        x = self.up1(z)             # (B,32,26,26)
+        x = self.up2(x)             # (B,32,26,26)
+        x = self.up3(x)             # (B,16,60,60)
+        x = self.up4(x)             # (B,out,ch,64,64)
+        x = self.refine(x)          # refine
+
+        # Ensure output is exactly 64×64 (rare off-by-one)
+        x = F.interpolate(x, size=(64,64), mode="bilinear", align_corners=False)
+
+        return x
+
+
 
 class ProprioDecoder(nn.Module):
     """
@@ -14,15 +144,12 @@ class ProprioDecoder(nn.Module):
         super().__init__()
         
         self.net = nn.Sequential(
-            nn.LayerNorm(emb_dim),
             nn.Linear(emb_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, output_dim),
         )
     
-    def forward(self, token):
+    def forward(self, token, mean=None, std=None):
         """
         Args:
             token: (B, D) proprioceptive latent
@@ -30,7 +157,10 @@ class ProprioDecoder(nn.Module):
         Returns:
             state: (B, state_dim) decoded state
         """
-        return self.net(token)
+        out = self.net(token)
+        if mean is not None and std is not None:
+            out = out * std + mean
+        return out
 
 
 
