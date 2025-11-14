@@ -9,16 +9,13 @@ from torch.optim.lr_scheduler import LambdaLR
 from src.losses import TemporalVCRegLossOptimized as TemporalVCRegLoss
 from src.components.encoder import RepeatEncoder, VisualEncoder, ProprioEncoder, MLPProjection
 from src.components.decoder import VisualDecoder, ProprioDecoder, RegressionTransformerDecoder
-from src.components.predictor import TransformerDecoderPredictor, TransformerEncoderPredictor
+from src.components.predictor import EncoderDecoderPredictor, TransformerDecoderPredictor, TransformerEncoderPredictor
 
 
 def focal_mse(pred, target, gamma=2):
     err = (pred - target)
     return ((err.abs() ** gamma) * (err ** 2))
 def cosine_loss(pred, target):
-    # pred: (B, ..., D)
-    # target: (B, ..., D)
-    # dim=-1 computes similarity along the embedding dimension
     return 1.0 - F.cosine_similarity(pred, target, dim=-1).mean()
 
 
@@ -66,16 +63,11 @@ class JEPA(L.LightningModule):
         self.action_encoder     = RepeatEncoder(emb_dim=emb_dim, input_dim=2)
 
         # Predictor
-        # self.predictor = TransformerDecoderPredictor(
-        #     emb_dim=emb_dim,
-        #     num_heads=4,
-        #     num_layers=2,
-        #     mlp_dim=128,
-        # )
-        self.predictor = TransformerEncoderPredictor(
+        self.predictor = EncoderDecoderPredictor(
             emb_dim=emb_dim,
             num_heads=4,
-            num_layers=3,
+            num_encoder_layers=3,
+            num_decoder_layers=2,
             mlp_dim=128,
             residual=False
         )
@@ -181,9 +173,9 @@ class JEPA(L.LightningModule):
         """
         orig = torch.cat([z_cls, z_patches, z_state], dim=1)
         pred_cls, pred_patches, pred_state = self.predictor(z_cls, z_patches, z_state, z_action)
-        pred_cls = orig[:, 0] + pred_cls
-        pred_patches = orig[:, 1:-1] + pred_patches
-        pred_state = orig[:, -1] + pred_state
+        # pred_cls = orig[:, 0] + pred_cls
+        # pred_patches = orig[:, 1:-1] + pred_patches
+        # pred_state = orig[:, -1] + pred_state
         return pred_cls, pred_patches, pred_state
 
     def shared_step(self, batch, batch_idx):
@@ -316,12 +308,11 @@ class JEPA(L.LightningModule):
         )
 
         # Prediction losses
-        # loss_pred_cls = F.mse_loss(z_cls_next_pred, z_cls_next.detach())
-        # loss_pred_patches = F.mse_loss(z_patches_next_pred, z_patches_next.detach())
-        # loss_pred_states = F.mse_loss(z_states_next_pred, z_states_next.detach())
-        loss_pred_cls = cosine_loss(z_cls_next_pred, z_cls_next)
-        loss_pred_patches = cosine_loss(z_patches_next_pred, z_patches_next)
-        loss_pred_states = cosine_loss(z_states_next_pred, z_states_next)
+
+        # Normalize
+        loss_pred_cls       = F.mse_loss(z_cls_next_pred, z_cls_next)
+        loss_pred_patches   = F.mse_loss(z_patches_next_pred, z_patches_next)
+        loss_pred_states    = F.mse_loss(z_states_next_pred, z_states_next)
 
         # Combine prediction losses
         weights = [ 1.0, 10.0, 2.0 ]
@@ -333,7 +324,7 @@ class JEPA(L.LightningModule):
         #
         #   Total loss
         #
-        loss = recon_loss + vcreg_loss + cross_coherence_loss + idm_loss + prediction_loss
+        loss = recon_loss + vcreg_loss + cross_coherence_loss + idm_loss + 10.0 * prediction_loss
 
         return {
             "loss": loss,
@@ -482,18 +473,13 @@ class JEPA(L.LightningModule):
         # Encode action
         z_action = self.action_encoder(action)
 
-        # Predictor outputs *deltas* in latent space
-        delta_cls, delta_patches, delta_state = self.predictor(
+        # Predictor outputs in latent space
+        z_cls_next, z_patches_next, z_state_next = self.predictor(
             z_cls.unsqueeze(1),   # (B, 1, D)
             z_patches,            # (B, N, D)
             z_state.unsqueeze(1), # (B, 1, D)
             z_action,             # (B, D)
         )
-
-        # Apply deltas to get next latents
-        z_cls_next     = z_cls     + delta_cls
-        z_patches_next = z_patches + delta_patches
-        z_state_next   = z_state   + delta_state
 
         return {
             "z_cls_next": z_cls_next,
