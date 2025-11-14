@@ -239,6 +239,7 @@ class PointMazeSequencesDataModule(LightningDataModule):
         pin_memory: bool = True,
         normalize: bool = True,
         seq_len: int = 3,
+        stride: int = 3,
         epoch_fraction: float = 1.0,
         seed: int = 0,
         device: Optional[torch.device] = None,
@@ -256,6 +257,7 @@ class PointMazeSequencesDataModule(LightningDataModule):
         self.seed = seed
         self.device = device
         self.frame_size = frame_size
+        self.stride = stride
 
         # internal containers
         self.ds_full = None
@@ -276,6 +278,7 @@ class PointMazeSequencesDataModule(LightningDataModule):
                 seq_len=self.seq_len,
                 normalize=self.normalize,
                 frame_size=self.frame_size,
+                stride=self.stride,
             )
 
             n_total = len(self.ds_full)
