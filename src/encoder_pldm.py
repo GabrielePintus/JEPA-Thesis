@@ -8,7 +8,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from src.components.decoder import IDMDecoder, MeNet6Decoder
 from src.losses import TemporalVCRegLossOptimized as TemporalVCRegLoss
-from src.components.encoder import MeNet6, Expander2D, MeNet6_Large
+from src.components.encoder import MeNet6, Expander2D
 from src.components.predictor import ConvPredictor
 
 
@@ -16,6 +16,11 @@ class PLDMEncoder(L.LightningModule):
 
     def __init__(
         self,
+        alpha: float = 54.5,
+        beta: float = 15.5,
+        delta: float = 0.1,
+        omega: float = 5.2,
+        horizon: int = 16,
         initial_lr_encoder : float = 2e-3,
         final_lr_encoder : float = 1e-5,
         weight_decay_encoder : float = 1e-4,
@@ -44,31 +49,67 @@ class PLDMEncoder(L.LightningModule):
         # Predictor
         self.predictor = ConvPredictor(
             in_channels=20,
-            hidden_channels=36,
+            hidden_channels=32,
             out_channels=18,
         )
         
-        self.proj = nn.Sequential(
-            nn.Linear(26*26, 26*26*2),
-            # nn.ReLU(),
-            # nn.Linear(26*26*2, 26*26*4),
-        )
-        self.tvcreg_loss = TemporalVCRegLoss()
+        self.proj = nn.Linear(26*26, 26*26*2)
+        self.tvcreg_loss = TemporalVCRegLoss(var_coeff=alpha, cov_coeff=beta)
 
         if compile:
             self.visual_encoder = torch.compile(self.visual_encoder)
             self.visual_decoder = torch.compile(self.visual_decoder)
             self.predictor = torch.compile(self.predictor)
             self.idm = torch.compile(self.idm)
-            # self.proj = torch.compile(self.proj)
+            self.proj = torch.compile(self.proj)
 
 
     def encode_state(self, state, frame):
+        B, T, _ = state.shape
+
+        # Flatten for encoding
+        state = state.flatten(0, 1)
+        frame = frame.flatten(0, 1)
+
         expanded_state = self.proprio_expander(state)
-        # x = torch.cat([frame, expanded_state], dim=1)
         z = self.visual_encoder(frame)
         z = torch.cat([z, expanded_state], dim=1)
+
+        # Reshape back
+        z = z.view(B, T, -1, 26, 26) # (B, T, 16, 26, 26)
+
         return z
+    
+    def decode_visual(self, z):
+        B, T, C, H, W = z.shape
+        z = z.flatten(0,1)
+        recon_frame = self.visual_decoder(z[:, :16])
+        return recon_frame
+    
+    def predict_state_parallel(self, z, action):
+        print("z: ", z.shape)
+        print("action: ", action.shape)
+        B, T, C, H, W = z.shape
+        print("z input: ", z.shape)
+        z = z.flatten(0,1)
+        print("z flattened: ", z.shape)
+        action_expanded = self.action_expander(action)
+        x = torch.cat([z, action_expanded], dim=1)
+        print("x input: ", x.shape)
+        z_pred = self.predictor(x)
+        print("z_pred before view: ", z_pred.shape)
+        z_pred = z_pred.view(B, T, C, H, W)
+        return z_pred
+    def predict_state(self, z, action):
+        """
+        z: (B, C, H, W)
+        action: (B, action_dim)
+        returns: z_pred (B, C, H, W)
+        """
+        action_expanded = self.action_expander(action)
+        x = torch.cat([z, action_expanded], dim=1)
+        z_pred = self.predictor(x)
+        return z_pred
     
     def shared_step(self, batch, batch_idx):
         states, frames, actions = batch
@@ -77,53 +118,50 @@ class PLDMEncoder(L.LightningModule):
         # Drop x,y infomation
         states = states[..., 2:]
 
-        # Reshape for encoding
-        state = states.flatten(0, 1)
-        frame = frames.flatten(0, 1)
-        action = actions.flatten(0, 1)
 
         # Encode
-        # z = self.encode_state(state, frame)
-        z_visual = self.visual_encoder(frame)
-        state_expanded = self.proprio_expander(state)
-        action_expanded = self.action_expander(action)
+        z = self.encode_state(states, frames) # (B, T, 18, 26, 26)
 
         # Decode
-        recon_frame = self.visual_decoder(z_visual.detach())
-        recon_loss = F.mse_loss(recon_frame, frame)
+        recon_frame = self.decode_visual(z.detach())
+        recon_loss = F.mse_loss(recon_frame, frames.flatten(0,1))
+
         # Temporal VCReg loss
-        z_proj = z_visual.view(B, T+1, 16, 26, 26).permute(0,2,1,3,4)  # (B, C, T, H, W)
-        z_proj = z_proj.flatten(0, 1) # (B*C, T, H, W)
-        z_proj = z_proj.view(B * 16, T+1, 26*26) # (B*C, T, H*W)
-        z_proj = self.proj(z_proj) # (B*C, T, H*W*4)
+        z_proj = z.view(B, T+1, 18, 26, 26).permute(0,2,1,3,4)  # (B, C, T, H, W)
+        z_proj = z_proj.flatten(0,1) # (B*C, T, H, W)
+        z_proj = z_proj.view(B * 18, T+1, 26*26) # (B*C, T, H*W)
+        z_proj = self.proj(z_proj)  # (B*C, T, H*W*2)
         loss_tvcreg = self.tvcreg_loss(z_proj)
 
-        # Predict future latents
-        z = torch.cat([z_visual, state_expanded], dim=1)  # (B*(T+1), C+2, H, W)
-        z_curr = z.view(B, T+1, 18, 26, 26)[:, :-1]  # (B, T, C, H, W)
-        z_next = z.view(B, T+1, 18, 26, 26)[:, 1:]   # (B, T, C, H, W)
-        z_curr = z_curr.flatten(0,1)  # (B*T, C, H, W)
-        z_next = z_next.flatten(0,1)    # (B*T, C, H, W)
-        action_expanded = action_expanded.view(B, T, 2, 26, 26).flatten(0,1)  # (B*T, 2, H, W)
+        # Predictive loss
+        z_pred_list = []
+        z_current = z[:, 0]  # (B, 18, 26, 26) - initial state
+        
+        for t in range(T):
+            # Predict next state using current state and action at time t
+            z_next_pred = self.predict_state(z_current, actions[:, t])  # (B, 18, 26, 26)
+            z_pred_list.append(z_next_pred)
+            z_current = z_next_pred  # Use predicted state for next step
+        
+        # Stack predictions: (B, T, 18, 26, 26)
+        z_pred = torch.stack(z_pred_list, dim=1)
+        
+        # Compare predictions with ground truth latents z[:, 1:T+1]
+        z_target = z[:, 1:T+1]  # (B, T, 18, 26, 26)
+        pred_loss = F.mse_loss(z_pred, z_target)
 
-        z_curr = torch.cat([z_curr, action_expanded], dim=1)  # (B*T, C+2, H, W)
-        z_pred = self.predictor(z_curr)  # (B*T, C, H, W)
-        pred_loss = F.mse_loss(z_pred, z_next)
+        # Smoothness loss
+        smooth_loss = F.mse_loss(z[:, 1:], z[:, :-1])
 
-        # IDM
-        idm_input = torch.cat([z_curr[:, :-2], z_next], dim=1)  # (B*T, C+2+C, H, W)
-        action_pred = self.idm(idm_input)  # (B*T, 2, H, W)
-        idm_loss = F.mse_loss(action_pred, action)
+        # IDM loss (optional)
+        idm_in_1 = z[:, :-1].flatten(0,1)
+        idm_in_2 = z[:, 1:].flatten(0,1)
+        idm_in = torch.cat([idm_in_1, idm_in_2], dim=1)
+        idm_pred = self.idm(idm_in)
+        idm_loss = F.mse_loss(idm_pred, actions.flatten(0,1))
 
-        # # Latent smoothness
-        # diff = z_next[:, :16, :, :] - z_curr[:, :16, :, :]
-        # smooth_loss = diff.pow(2).mean()
-
-        dz = (z_next[:, :16] - z_curr[:, :16]).flatten(1).norm(dim=1)
-        smooth_loss = F.relu(dz - 5).pow(2).mean()
-
-
-        loss = recon_loss + loss_tvcreg['loss'] + pred_loss + idm_loss + smooth_loss * 1e-2
+        jepa_loss = pred_loss + loss_tvcreg['loss'] + self.hparams.delta * smooth_loss + idm_loss * self.hparams.omega
+        loss = recon_loss + jepa_loss
 
         return {
             "loss": loss,
@@ -134,6 +172,7 @@ class PLDMEncoder(L.LightningModule):
             "pred_loss": pred_loss,
             "idm_loss": idm_loss,
             "smooth_loss": smooth_loss,
+            "jepa_loss": jepa_loss,
         }
 
 

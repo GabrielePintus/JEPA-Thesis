@@ -330,8 +330,8 @@ class GradientPlanner(BasePlanner):
             # if actions.shape != (1, T, A):
             #     raise ValueError(f"init_actions must have shape (1,{T},{A}), got {actions.shape}")
         else:
-            # actions = torch.zeros(1, T, A, device=self.device)
-            actions = 0.01 * torch.randn(1, T, A, device=self.device)
+            actions = torch.zeros(1, T, A, device=self.device)
+            # actions = 0.01 * torch.randn(1, T, A, device=self.device)
 
         actions.requires_grad_(True)
 
@@ -356,8 +356,7 @@ class GradientPlanner(BasePlanner):
 
             # Rollout latents
             latents = rollout_latent(self.model, z0, actions, detach_model=False)
-
-            # Compute cost
+            
             cost, components = self.cost_fn(latents, actions, z_goal)
             total_cost = cost.mean()
 
@@ -376,15 +375,9 @@ class GradientPlanner(BasePlanner):
             # Adam update
             optimizer.step()
 
-            # -----------------------------
-            # Update best solution
-            # -----------------------------
+            # Clip actions after update
             with torch.no_grad():
-                current_cost = total_cost.item()
-                if current_cost < best_cost:
-                    best_cost = current_cost
-                    best_actions = actions.detach().clone()
-                    best_latents = latents.detach().clone()  # if trajectory needed
+                actions.data = self._clip_actions(actions.data)
 
             # Verbose logging
             if verbose:
@@ -396,22 +389,13 @@ class GradientPlanner(BasePlanner):
                 history.append(info)
                 progressbar.set_postfix(info)
 
-        # -----------------------------
-        # Final: compute best clipped solution
-        # -----------------------------
-        with torch.no_grad():
-            best_actions = self._clip_actions(best_actions)
-            best_latents_final = rollout_latent(self.model, z0, best_actions, detach_model=True)
-            best_cost_final, _ = self.cost_fn(best_latents_final, best_actions, z_goal)
-
         out = {
-            "actions": best_actions,             # best (1, T, A)
-            "cost": best_cost_final.detach(),    # (1,)
+            "actions": actions.detach(),             # best (1, T, A)
+            "cost": total_cost.detach(),    # (1,)
         }
 
         if return_trajectory:
-            out["latents"] = best_latents_final
-
+            out["latents"] = latents.detach()
         if verbose:
             out["history"] = history
 

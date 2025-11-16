@@ -1,15 +1,15 @@
 trainer:
-  max_epochs: 100
+  max_epochs: 10
   accelerator: gpu
   devices: 1
   num_nodes: 1
   strategy: ddp_find_unused_parameters_false
   precision: bf16-mixed
   # gradient clipping
-  gradient_clip_val: 2.0
+  # gradient_clip_val: 2.0
   gradient_clip_algorithm: norm
   # gradient accumulation (accumulate gradients for N steps before optimizer step)
-  accumulate_grad_batches: 2
+  accumulate_grad_batches: 1
   callbacks:
   - class_path: lightning.pytorch.callbacks.ModelCheckpoint
     init_args:
@@ -31,17 +31,21 @@ trainer:
 
 
 model:
-  initial_lr_encoder: 3e-3
-  final_lr_encoder: 1e-4
+  initial_lr_encoder: 5e-2
+  final_lr_encoder: 1e-8
   weight_decay_encoder: 1e-5
   initial_lr_decoder: 1e-3
-  final_lr_decoder: 1e-6
-  initial_lr_predictor: 1e-3
-  final_lr_predictor: 1e-5
+  final_lr_decoder: 1e-5
+  initial_lr_predictor: 5e-2
+  final_lr_predictor: 1e-8
   weight_decay_predictor: 1e-5
   weight_decay_decoder: 0
   warmup_steps: 1000
-  compile: false
+  compile: true
+  alpha: 54.5
+  beta: 15.5
+  delta: 0.1
+  omega: 5.2
 
 
 data:
@@ -50,6 +54,6 @@ data:
   num_workers: 2
   pin_memory: true
   val_size: 0.1
-  seq_len: 2
-  stride: 2
+  seq_len: 15
+  stride: 1
   normalize: false
