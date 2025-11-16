@@ -54,11 +54,48 @@ class Expander2D(nn.Module):
 
         return out
 
+class MeNet6_Large(nn.Module):
+    """
+    ~100k-parameter variant of MeNet6.
+    Same structure, just wider + one extra conv block.
+    """
+    def __init__(self, input_channels=3):
+        super().__init__()
+        self.activation = nn.ReLU()
 
+        self.net = nn.Sequential(
+            # 3 → 32
+            nn.Conv2d(input_channels, 32, kernel_size=5, stride=1),
+            nn.GroupNorm(8, 32),
+            self.activation,
 
-#
-#   CUSTOM
-#
+            # 32 → 64
+            nn.Conv2d(32, 64, kernel_size=5, stride=2),
+            nn.GroupNorm(16, 64),
+            self.activation,
+
+            # 64 → 64
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.GroupNorm(16, 64),
+            self.activation,
+
+            # Extra block (new)
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(16, 64),
+            self.activation,
+
+            # 64 → 64
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(16, 64),
+            self.activation,
+
+            # projection to 32 channels for latent compatibility
+            nn.Conv2d(64, 16, kernel_size=1, stride=1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 
 
 

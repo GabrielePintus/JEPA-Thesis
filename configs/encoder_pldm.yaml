@@ -22,17 +22,17 @@ trainer:
       auto_insert_metric_name: false       # keep filename clean
       every_n_epochs: 1
       save_on_train_epoch_end: true
-  # logger:
-  #   class_path: lightning.pytorch.loggers.WandbLogger
-  #   init_args:
-  #     project: "JEPA"
-  #     name: "PointMaze/VisualEncoder"
-  #     log_model: true
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: "JEPA"
+      name: "PointMaze/VisualEncoder"
+      log_model: true
 
 
 model:
   initial_lr_encoder: 3e-3
-  final_lr_encoder: 1e-5
+  final_lr_encoder: 1e-4
   weight_decay_encoder: 1e-5
   initial_lr_decoder: 1e-3
   final_lr_decoder: 1e-6
@@ -41,12 +41,12 @@ model:
   weight_decay_predictor: 1e-5
   weight_decay_decoder: 0
   warmup_steps: 1000
-  compile: true
+  compile: false
 
 
 data:
   data_path: data/train_trajectories_1000_100_4_64_largerdot.npz
-  batch_size: 64
+  batch_size: 128
   num_workers: 2
   pin_memory: true
   val_size: 0.1

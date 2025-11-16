@@ -3,77 +3,6 @@ import torch.nn as nn
 
 
 
-class ResUpBlock(nn.Module):
-    """
-    Residual upsampling block:
-        x → upsample → conv → conv → residual add
-    """
-    def __init__(self, in_ch, out_ch, scale_factor=2):
-        super().__init__()
-        self.scale = scale_factor
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        self.proj  = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-
-    def forward(self, x):
-        # Upsample
-        x_up = F.interpolate(x, scale_factor=self.scale, mode="bilinear", align_corners=False)
-
-        # Residual block
-        y = F.gelu(self.conv1(x_up))
-        y = self.conv2(y)
-        return F.gelu(y + self.proj(x_up))  # skip connection
-        
-
-class MeNet6DecoderStrong(nn.Module):
-    """
-    Stronger, smoother, high-capacity decoder for MeNet6.
-    Input:  (B,16,26,26)
-    Output: (B,3,64,64)
-    """
-    def __init__(self, out_channels=3):
-        super().__init__()
-
-        # First expand channels BEFORE upsampling
-        self.pre = nn.Sequential(
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 32, 3, padding=1),
-            nn.GELU(),
-        )
-
-        # Upsample 26 → 52 (approx original 28→60)
-        self.up1 = ResUpBlock(32, 32, scale_factor=2)
-
-        # Slight refine at 52×52
-        self.refine1 = nn.Sequential(
-            nn.Conv2d(32, 32, 3, padding=1),
-            nn.GELU(),
-        )
-
-        # Upsample 52 → 64
-        self.up2 = ResUpBlock(32, 16, scale_factor=64/52)  # ≈1.23 upscale
-
-        # Final refinement
-        self.refine2 = nn.Sequential(
-            nn.Conv2d(16, 16, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, out_channels, 3, padding=1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, z):
-        """
-        z: (B,16,26,26)
-        """
-        x = self.pre(z)                # → (B,32,26,26)
-        x = self.up1(x)                # → (B,32,52,52)
-        x = self.refine1(x)            # refine
-        x = self.up2(x)                # → (B,16,64,64)
-        x = self.refine2(x)            # → (B,3,64,64)
-        return x
-
-
 
 class MeNet6Decoder(nn.Module):
     """
@@ -132,6 +61,60 @@ class MeNet6Decoder(nn.Module):
 
         return x
 
+
+# class IDMDecoder(nn.Module):
+#     """
+#     Decoder for IDM state from latent representation.
+#     Project C, H, W to 1, H, W using Conv2d.
+#     """
+    
+#     def __init__(self, input_channels=32, output_dim=2, hidden_dim=128):
+#         super().__init__()
+#         self.mlp1 = nn.Sequential(
+#             nn.LayerNorm(26*26),
+#             nn.Linear(26 * 26, hidden_dim),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, hidden_dim),
+#         )
+#         self.mlp2 = nn.Sequential(
+#             nn.Linear(16*2*hidden_dim, hidden_dim),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, output_dim),
+#         )
+    
+#     def forward(self, x):
+#         B, C, H, W = x.shape
+#         x = x.view(B, C, H * W)
+#         x = self.mlp1(x)
+#         x = x.view(B, -1)
+#         x = self.mlp2(x)
+#         return x
+        
+
+class IDMDecoder(nn.Module):
+    """
+    Decoder for IDM state from latent representation.
+    Project C, H, W to 1, H, W using Conv2d.
+    """
+    
+    def __init__(self, input_channels=32, output_dim=2, hidden_dim=128):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(input_channels, input_channels, kernel_size=7, padding=3, stride=2),
+            nn.GELU(),
+            nn.Conv2d(input_channels, input_channels*2, kernel_size=7, padding=3, stride=2),
+            nn.Flatten(),
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(3528, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+    
+    def forward(self, x):
+        out = self.cnn(x)  # (B, C, H', W')
+        out = self.mlp(out)
+        return out
 
 
 class ProprioDecoder(nn.Module):

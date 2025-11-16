@@ -6,9 +6,9 @@ import lightning as L
 from torch.optim.lr_scheduler import LambdaLR
 
 
-from src.components.decoder import MeNet6Decoder, MeNet6DecoderStrong
+from src.components.decoder import IDMDecoder, MeNet6Decoder
 from src.losses import TemporalVCRegLossOptimized as TemporalVCRegLoss
-from src.components.encoder import MeNet6, Expander2D
+from src.components.encoder import MeNet6, Expander2D, MeNet6_Large
 from src.components.predictor import ConvPredictor
 
 
@@ -33,34 +33,41 @@ class PLDMEncoder(L.LightningModule):
         self.save_hyperparameters()
 
         # Encoders
-        self.visual_encoder = MeNet6(input_channels=5)
-        self.proprio_expander = Expander2D(target_shape=(64, 64), out_channels=2)
+        self.visual_encoder = MeNet6(input_channels=3)
+        self.proprio_expander = Expander2D(target_shape=(26, 26), out_channels=2)
         self.action_expander = Expander2D(target_shape=(26, 26), out_channels=2)
 
         # Decoders
         self.visual_decoder = MeNet6Decoder(out_channels=3)
-        # self.visual_decoder = MeNet6DecoderStrong(out_channels=3)
+        self.idm = IDMDecoder(input_channels=36, output_dim=2)
 
         # Predictor
         self.predictor = ConvPredictor(
-            in_channels=18,
+            in_channels=20,
             hidden_channels=36,
-            out_channels=16,
+            out_channels=18,
         )
         
-        self.proj = nn.Linear(26*26, 26*26*2)
+        self.proj = nn.Sequential(
+            nn.Linear(26*26, 26*26*2),
+            # nn.ReLU(),
+            # nn.Linear(26*26*2, 26*26*4),
+        )
         self.tvcreg_loss = TemporalVCRegLoss()
 
         if compile:
             self.visual_encoder = torch.compile(self.visual_encoder)
             self.visual_decoder = torch.compile(self.visual_decoder)
-            self.proj = torch.compile(self.proj)
+            self.predictor = torch.compile(self.predictor)
+            self.idm = torch.compile(self.idm)
+            # self.proj = torch.compile(self.proj)
 
 
     def encode_state(self, state, frame):
         expanded_state = self.proprio_expander(state)
-        x = torch.cat([frame, expanded_state], dim=1)
-        z = self.visual_encoder(x)
+        # x = torch.cat([frame, expanded_state], dim=1)
+        z = self.visual_encoder(frame)
+        z = torch.cat([z, expanded_state], dim=1)
         return z
     
     def shared_step(self, batch, batch_idx):
@@ -76,23 +83,25 @@ class PLDMEncoder(L.LightningModule):
         action = actions.flatten(0, 1)
 
         # Encode
-        z = self.encode_state(state, frame)
+        # z = self.encode_state(state, frame)
+        z_visual = self.visual_encoder(frame)
+        state_expanded = self.proprio_expander(state)
         action_expanded = self.action_expander(action)
 
         # Decode
-        recon_frame = self.visual_decoder(z.detach())
+        recon_frame = self.visual_decoder(z_visual.detach())
         recon_loss = F.mse_loss(recon_frame, frame)
-
         # Temporal VCReg loss
-        z_proj = z.view(B, T+1, 16, 26, 26).permute(0,2,1,3,4)  # (B, C, T, H, W)
+        z_proj = z_visual.view(B, T+1, 16, 26, 26).permute(0,2,1,3,4)  # (B, C, T, H, W)
         z_proj = z_proj.flatten(0, 1) # (B*C, T, H, W)
         z_proj = z_proj.view(B * 16, T+1, 26*26) # (B*C, T, H*W)
-        z_proj = self.proj(z_proj) # (B*C, T, H*W*2)
+        z_proj = self.proj(z_proj) # (B*C, T, H*W*4)
         loss_tvcreg = self.tvcreg_loss(z_proj)
 
         # Predict future latents
-        z_curr = z.view(B, T+1, 16, 26, 26)[:, :-1]  # (B, T, C, H, W)
-        z_next = z.view(B, T+1, 16, 26, 26)[:, 1:]   # (B, T, C, H, W)
+        z = torch.cat([z_visual, state_expanded], dim=1)  # (B*(T+1), C+2, H, W)
+        z_curr = z.view(B, T+1, 18, 26, 26)[:, :-1]  # (B, T, C, H, W)
+        z_next = z.view(B, T+1, 18, 26, 26)[:, 1:]   # (B, T, C, H, W)
         z_curr = z_curr.flatten(0,1)  # (B*T, C, H, W)
         z_next = z_next.flatten(0,1)    # (B*T, C, H, W)
         action_expanded = action_expanded.view(B, T, 2, 26, 26).flatten(0,1)  # (B*T, 2, H, W)
@@ -101,10 +110,20 @@ class PLDMEncoder(L.LightningModule):
         z_pred = self.predictor(z_curr)  # (B*T, C, H, W)
         pred_loss = F.mse_loss(z_pred, z_next)
 
+        # IDM
+        idm_input = torch.cat([z_curr[:, :-2], z_next], dim=1)  # (B*T, C+2+C, H, W)
+        action_pred = self.idm(idm_input)  # (B*T, 2, H, W)
+        idm_loss = F.mse_loss(action_pred, action)
 
-        
+        # # Latent smoothness
+        # diff = z_next[:, :16, :, :] - z_curr[:, :16, :, :]
+        # smooth_loss = diff.pow(2).mean()
 
-        loss = recon_loss + loss_tvcreg['loss'] + pred_loss
+        dz = (z_next[:, :16] - z_curr[:, :16]).flatten(1).norm(dim=1)
+        smooth_loss = F.relu(dz - 5).pow(2).mean()
+
+
+        loss = recon_loss + loss_tvcreg['loss'] + pred_loss + idm_loss + smooth_loss * 1e-2
 
         return {
             "loss": loss,
@@ -113,6 +132,8 @@ class PLDMEncoder(L.LightningModule):
             'loss_tvcreg_cov': loss_tvcreg['cov-loss'],
             "recon_loss": recon_loss,
             "pred_loss": pred_loss,
+            "idm_loss": idm_loss,
+            "smooth_loss": smooth_loss,
         }
 
 
@@ -133,7 +154,9 @@ class PLDMEncoder(L.LightningModule):
         optimizer = torch.optim.AdamW(
             [
                 {
-                    "params": list(self.visual_encoder.parameters()) + list(self.proj.parameters()),
+                    "params": list(self.visual_encoder.parameters()) +
+                              list(self.idm.parameters()) +
+                              list(self.proj.parameters()),
                     "lr": self.hparams.initial_lr_encoder,
                     "weight_decay": self.hparams.weight_decay_encoder,
                 },

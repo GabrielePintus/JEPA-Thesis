@@ -10,6 +10,12 @@ class ConvPredictor(nn.Module):
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
             nn.GroupNorm(4, hidden_channels),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1),
+
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(4, hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.1),
 
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
             nn.GroupNorm(4, hidden_channels),
