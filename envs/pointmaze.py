@@ -625,3 +625,6 @@ class PointMazeEnv(MazeEnv, EzPickle):
     def data(self):
         """Returns the MuJoCo simulation data."""
         return self.point_env.data
+    
+    def get_factory(self):
+        return (self.__class__, dict())

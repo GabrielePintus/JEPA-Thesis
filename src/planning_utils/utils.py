@@ -274,6 +274,259 @@ class BasePlanner(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError()
 
+
+# -------------------------------------------------------------------
+# Model Predictive Path Integral (MPPI) planner
+# -------------------------------------------------------------------
+
+class MPPIPlanner(BasePlanner):
+    """
+    Model Predictive Path Integral Control (MPPI).
+    
+    MPPI is an advanced sampling-based method that:
+      - Samples K action trajectories with colored noise
+      - Computes trajectory costs using the learned dynamics model
+      - Uses temperature-based exponential weighting: w_i ∝ exp(-1/λ * S_i)
+      - Updates control via weighted average of sampled trajectories
+      - Supports momentum-based updates and adaptive temperature
+    
+    Key differences from PIC:
+      - Uses raw costs in exponential, not cost differences
+      - Temperature parameter λ controls exploration/exploitation
+      - Can use colored noise for more realistic action sequences
+      - Optional momentum for smoother convergence
+    
+    Args:
+        model: PLDMEncoder with predictor
+        cost_fn: Cost function for trajectory evaluation
+        horizon: Planning horizon T
+        action_dim: Action dimensionality
+        action_bounds: (min, max) action limits
+        device: torch device
+        num_samples: Number of trajectory samples K
+        noise_std: Standard deviation for action noise
+        temperature: Temperature λ for importance weighting (lower = more exploitation)
+        init_std: Initial action std for warm start
+        momentum: Momentum coefficient for mean update (0 = no momentum, 1 = only momentum)
+        colored_noise: If True, use temporally correlated noise
+        noise_beta: Smoothing parameter for colored noise (higher = smoother)
+        use_best_sample: Return best sample instead of weighted mean
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        cost_fn: BaseCostFunction,
+        horizon: int,
+        action_dim: int,
+        action_bounds: Optional[Tuple[float, float]] = None,
+        device: Optional[torch.device] = None,
+        num_samples: int = 512,
+        noise_std: float = 0.5,
+        temperature: float = 1.0,
+        init_std: float = 0.5,
+        momentum: float = 0.0,
+        colored_noise: bool = False,
+        noise_beta: float = 0.8,
+        use_best_sample: bool = False,
+    ):
+        super().__init__()
+        self.model = model
+        self.cost_fn = cost_fn
+        self.horizon = horizon
+        self.action_dim = action_dim
+        self.num_samples = num_samples
+        self.noise_std = noise_std
+        self.temperature = temperature
+        self.init_std = init_std
+        self.momentum = momentum
+        self.colored_noise = colored_noise
+        self.noise_beta = noise_beta
+        self.use_best_sample = use_best_sample
+        self.device = device or next(model.parameters()).device
+        
+        if action_bounds is not None:
+            self.action_min, self.action_max = action_bounds
+        else:
+            self.action_min, self.action_max = -1.0, 1.0
+
+    def _clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Clip actions to valid bounds."""
+        return torch.clamp(actions, self.action_min, self.action_max)
+
+    def _sample_colored_noise(self, num_samples: int, horizon: int, action_dim: int) -> torch.Tensor:
+        """
+        Generate temporally correlated (colored) noise for more realistic action sequences.
+        
+        Uses exponential smoothing: ε_t = β * ε_{t-1} + (1-β) * n_t
+        where n_t ~ N(0, I)
+        
+        Args:
+            num_samples: Number of noise sequences
+            horizon: Time steps
+            action_dim: Action dimension
+            
+        Returns:
+            noise: (num_samples, horizon, action_dim)
+        """
+        noise = torch.zeros(num_samples, horizon, action_dim, device=self.device)
+        noise[:, 0] = torch.randn(num_samples, action_dim, device=self.device)
+        
+        for t in range(1, horizon):
+            white_noise = torch.randn(num_samples, action_dim, device=self.device)
+            noise[:, t] = self.noise_beta * noise[:, t-1] + (1 - self.noise_beta) * white_noise
+            
+        # Normalize to maintain variance
+        noise = noise * self.noise_std / noise.std()
+        return noise
+
+    def plan(
+        self,
+        z0: torch.Tensor,
+        z_goal: torch.Tensor,
+        num_iterations: int,
+        init_actions: Optional[torch.Tensor] = None,
+        verbose: bool = False,
+        return_trajectory: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Plan action sequence using MPPI.
+        
+        Args:
+            z0: Initial latent state (1, C, H, W)
+            z_goal: Goal latent state (1, C, H, W)
+            num_iterations: Number of MPPI iterations
+            init_actions: Optional warm start (1, T, A)
+            verbose: Print progress
+            return_trajectory: Include full latent trajectory in output
+            
+        Returns:
+            Dictionary with:
+                - actions: (1, T, A) optimal action sequence
+                - cost: (1,) final cost
+                - latents: (1, T+1, C, H, W) if return_trajectory=True
+                - history: list of iteration info if verbose=True
+        """
+        z0 = z0.to(self.device)
+        z_goal = z_goal.to(self.device)
+
+        if z0.shape[0] != 1:
+            raise ValueError("MPPIPlanner currently assumes batch size B=1 for z0.")
+        
+        B = 1
+        T = self.horizon
+        A = self.action_dim
+
+        # Initialize mean action sequence μ
+        if init_actions is None:
+            mu = self.init_std * torch.randn(T, A, device=self.device)
+        else:
+            init_actions = init_actions.to(self.device)
+            if init_actions.shape != (B, T, A):
+                raise ValueError(f"init_actions must have shape (1, {T}, {A}), got {init_actions.shape}")
+            mu = init_actions[0].clone().detach()
+
+        mu = self._clip_actions(mu)
+        
+        # For momentum-based updates
+        mu_prev = mu.clone()
+
+        history = []
+        best_actions = None
+        best_cost = None
+        best_latents = None
+
+        progressbar = tqdm(range(num_iterations), desc="MPPI", disable=not verbose)
+        
+        for it in progressbar:
+            # Sample K noisy action sequences
+            if self.colored_noise:
+                noise = self._sample_colored_noise(self.num_samples, T, A)
+            else:
+                noise = self.noise_std * torch.randn(self.num_samples, T, A, device=self.device)
+            
+            # Perturbed actions: A_k = μ + ε_k
+            actions = mu.unsqueeze(0) + noise  # (K, T, A)
+            actions = self._clip_actions(actions)
+
+            # Rollout and compute costs
+            with torch.no_grad():
+                latents = rollout_latent(self.model, z0, actions, detach_model=True)
+                costs, _ = self.cost_fn(latents, actions, z_goal)  # (K,)
+
+            # Track best sample
+            J = costs.detach()  # (K,)
+            min_idx = torch.argmin(J)
+            min_cost = J[min_idx]
+            
+            if best_cost is None or min_cost < best_cost:
+                best_cost = min_cost
+                best_actions = actions[min_idx].clone()
+                best_latents = latents[min_idx].clone()
+
+            # MPPI importance weighting: w_k ∝ exp(-S_k / λ)
+            # For numerical stability, subtract minimum cost
+            S_normalized = (J - J.min()) / self.temperature
+            weights = torch.softmax(-S_normalized, dim=0)  # (K,)
+
+            # Weighted update: μ_new = Σ_k w_k * A_k
+            mu_update = (weights.view(-1, 1, 1) * actions).sum(dim=0)  # (T, A)
+            
+            # Apply momentum if specified
+            if self.momentum > 0:
+                mu = self.momentum * mu_prev + (1 - self.momentum) * mu_update
+                mu_prev = mu.clone()
+            else:
+                mu = mu_update
+            
+            mu = self._clip_actions(mu)
+
+            if verbose:
+                info = {
+                    "iter": it,
+                    "mean_cost": float(J.mean().cpu()),
+                    "min_cost": float(min_cost.cpu()),
+                    "best_cost_so_far": float(best_cost.cpu()),
+                    "cost_std": float(J.std().cpu()),
+                    "weight_entropy": float(-(weights * torch.log(weights + 1e-10)).sum().cpu()),
+                }
+                history.append(info)
+                progressbar.set_postfix({
+                    "min": f"{info['min_cost']:.4f}",
+                    "best": f"{info['best_cost_so_far']:.4f}",
+                })
+
+        # Final output selection
+        if self.use_best_sample and best_actions is not None:
+            action_seq = best_actions
+            final_cost = best_cost
+            out_latents = best_latents
+        else:
+            action_seq = mu
+            # Recompute cost for mean trajectory
+            with torch.no_grad():
+                final_actions = action_seq.unsqueeze(0)
+                out_latents_temp = rollout_latent(self.model, z0, final_actions, detach_model=True)
+                final_cost, _ = self.cost_fn(out_latents_temp, final_actions, z_goal)
+                final_cost = final_cost[0]
+                out_latents = out_latents_temp[0]
+
+        out = {
+            "actions": action_seq.unsqueeze(0),  # (1, T, A)
+            "cost": final_cost.view(1).detach(),  # (1,)
+        }
+        
+        if return_trajectory:
+            out["latents"] = out_latents.unsqueeze(0)
+        
+        if verbose:
+            out["history"] = history
+            
+        return out
+
+
+
+
 # -------------------------------------------------------------------
 # Gradient-based planner (Adam) with best-action tracking
 # -------------------------------------------------------------------
@@ -295,6 +548,7 @@ class GradientPlanner(BasePlanner):
         lr: float = 1e-2,
         device: Optional[torch.device] = None,
         noise: float = 0.0,
+        momentum: float = 0.9
     ):
         self.model = model
         self.cost_fn = cost_fn
@@ -305,6 +559,7 @@ class GradientPlanner(BasePlanner):
         self.lr = lr
         self.device = device or next(model.parameters()).device
         self.noise = noise
+        self.momentum = momentum
 
         freeze_jepa(self.model)
 
@@ -335,7 +590,7 @@ class GradientPlanner(BasePlanner):
 
         actions.requires_grad_(True)
 
-        optimizer = torch.optim.Adam([actions], lr=self.lr, weight_decay=0.0)
+        optimizer = torch.optim.Adam([actions], lr=self.lr, weight_decay=0.0, betas=(self.momentum, 0.999))
         history = []
 
         # -----------------------------

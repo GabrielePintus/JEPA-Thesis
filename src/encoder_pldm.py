@@ -44,7 +44,7 @@ class PLDMEncoder(L.LightningModule):
 
         # Decoders
         self.visual_decoder = MeNet6Decoder(out_channels=3)
-        self.idm = IDMDecoder(input_channels=36, output_dim=2)
+        # self.idm = IDMDecoder(input_channels=36, output_dim=2)
 
         # Predictor
         self.predictor = ConvPredictor(
@@ -60,7 +60,7 @@ class PLDMEncoder(L.LightningModule):
             self.visual_encoder = torch.compile(self.visual_encoder)
             self.visual_decoder = torch.compile(self.visual_decoder)
             self.predictor = torch.compile(self.predictor)
-            self.idm = torch.compile(self.idm)
+            # self.idm = torch.compile(self.idm)
             self.proj = torch.compile(self.proj)
 
 
@@ -153,14 +153,14 @@ class PLDMEncoder(L.LightningModule):
         # Smoothness loss
         smooth_loss = F.mse_loss(z[:, 1:], z[:, :-1])
 
-        # IDM loss (optional)
-        idm_in_1 = z[:, :-1].flatten(0,1)
-        idm_in_2 = z[:, 1:].flatten(0,1)
-        idm_in = torch.cat([idm_in_1, idm_in_2], dim=1)
-        idm_pred = self.idm(idm_in)
-        idm_loss = F.mse_loss(idm_pred, actions.flatten(0,1))
+        # # IDM loss (optional)
+        # idm_in_1 = z[:, :-1].flatten(0,1)
+        # idm_in_2 = z[:, 1:].flatten(0,1)
+        # idm_in = torch.cat([idm_in_1, idm_in_2], dim=1)
+        # idm_pred = self.idm(idm_in)
+        # idm_loss = F.mse_loss(idm_pred, actions.flatten(0,1))
 
-        jepa_loss = pred_loss + loss_tvcreg['loss'] + self.hparams.delta * smooth_loss + idm_loss * self.hparams.omega
+        jepa_loss = pred_loss + loss_tvcreg['loss'] + self.hparams.delta * smooth_loss #+ idm_loss * self.hparams.omega
         loss = recon_loss + jepa_loss
 
         return {
@@ -170,7 +170,7 @@ class PLDMEncoder(L.LightningModule):
             'loss_tvcreg_cov': loss_tvcreg['cov-loss'],
             "recon_loss": recon_loss,
             "pred_loss": pred_loss,
-            "idm_loss": idm_loss,
+            # "idm_loss": idm_loss,
             "smooth_loss": smooth_loss,
             "jepa_loss": jepa_loss,
         }
@@ -194,7 +194,7 @@ class PLDMEncoder(L.LightningModule):
             [
                 {
                     "params": list(self.visual_encoder.parameters()) +
-                              list(self.idm.parameters()) +
+                            #   list(self.idm.parameters()) +
                               list(self.proj.parameters()),
                     "lr": self.hparams.initial_lr_encoder,
                     "weight_decay": self.hparams.weight_decay_encoder,

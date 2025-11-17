@@ -37,23 +37,24 @@ class MeNet6(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-
 class Expander2D(nn.Module):
-    """Expands a low-dimensional proprioceptive vector into a 2D feature map."""
-    def __init__(self, target_shape=(16, 16), out_channels=4):
+    """Expands a low-dimensional proprioceptive vector into a 2D feature map and applies BatchNorm1d before expansion."""
+    def __init__(self, target_shape=(16, 16), out_channels=4, use_batchnorm=True):
         super().__init__()
         self.target_shape = target_shape
         self.out_channels = out_channels
+        self.use_batchnorm = use_batchnorm
+        # apply 1D batch norm on the channel vector before reshaping/expanding
+        self.bn = nn.BatchNorm1d(out_channels) if use_batchnorm else None
 
     def forward(self, x):
-        # Flatten any extra dims except batch
         B = x.shape[0]
-        x = x.view(B, -1)
+        x = x.view(B, -1)                 # expect shape (B, out_channels)
+        if self.bn is not None:
+            x = self.bn(x)                # BN over (B, C)
         out = x.view(B, self.out_channels, 1, 1)
-        out = out.expand(-1, -1, *self.target_shape)
-
+        out = out.expand(-1, -1, *self.target_shape).contiguous()
         return out
-
 
 
 

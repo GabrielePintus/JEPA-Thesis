@@ -209,7 +209,7 @@ class PointMazeSequences(Dataset):
             frames = torch.zeros(self.seq_len+1, 3, 1, 1)
 
         return states, frames, actions
-
+    
 
 
 
