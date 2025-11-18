@@ -44,21 +44,70 @@ class MeNet6(nn.Module):
 
 
 class CNNEncoder(nn.Module):
-    """A simple CNN encoder that processes images into feature maps."""
-    def __init__(self, input_channels=3, feature_dim=32):
+    def __init__(self, input_channels=3, base_channels=32):
         super().__init__()
-        self.activation = nn.GELU()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 16, kernel_size=5, stride=1), # 
-            nn.GroupNorm(4, 16, eps=1e-05, affine=True),
+        self.activation = nn.GELU()  # Better than ReLU for smooth gradients
+        
+        # Stem: preserve more spatial information early
+        self.stem = nn.Sequential(
+            nn.Conv2d(input_channels, base_channels, kernel_size=3, stride=1, padding=1),
+            nn.GroupNorm(8, base_channels),
             self.activation,
-
-
         )
-
+        
+        # Residual blocks with gradual downsampling
+        self.block1 = self._make_residual_block(base_channels, base_channels*2, stride=2)
+        # (B, 64, 32, 32)
+        
+        self.block2 = self._make_residual_block(base_channels*2, base_channels*4, stride=2)
+        # (B, 128, 16, 16)
+        
+        self.block3 = self._make_residual_block(base_channels*4, base_channels*4, stride=2)
+        # (B, 128, 8, 8)
+        
+        # Don't pool too aggressively - keep 8×8 spatial structure
+        
+    def _make_residual_block(self, in_channels, out_channels, stride):
+        """Residual block for better gradient flow"""
+        return nn.Sequential(
+            # Main path
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, 
+                     stride=stride, padding=1),
+            nn.GroupNorm(min(32, out_channels//4), out_channels),
+            self.activation,
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, 
+                     stride=1, padding=1),
+            nn.GroupNorm(min(32, out_channels//4), out_channels),
+        )
+    
     def forward(self, x):
-        return self.encoder(x)
+        x = self.stem(x)
+        
+        # Residual connections
+        x1 = self.block1(x)
+        x2 = self.block2(x1) 
+        x3 = self.block3(x2)
+        
+        return x3  # (B, 128, 8, 8)
 
+class MLPHead(nn.Module):
+    def __init__(self, spatial_features=128*8*8, emb_dim=256):
+        super().__init__()
+        
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.LayerNorm(spatial_features),
+            nn.Linear(spatial_features, emb_dim * 2),
+            nn.GELU(),
+            nn.Linear(emb_dim * 2, emb_dim),
+            nn.GELU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+    
+    def forward(self, x):
+        h = self.head(x)
+        # Unit norm embeddings make distances more interpretable
+        return F.normalize(h, p=2, dim=-1)
 
 
 class Expander2D(nn.Module):

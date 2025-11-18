@@ -1,5 +1,5 @@
 trainer:
-  max_epochs: 500
+  max_epochs: 100
   accelerator: gpu
   devices: 1
   num_nodes: 1
@@ -9,7 +9,7 @@ trainer:
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   # gradient accumulation (accumulate gradients for N steps before optimizer step)
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 2
   callbacks:
   - class_path: lightning.pytorch.callbacks.ModelCheckpoint
     init_args:
@@ -33,14 +33,15 @@ trainer:
 model:
   initial_lr: 5e-4
   final_lr: 1e-6
-  weight_decay: 1e-4
+  weight_decay: 1e-5
   warmup_steps: 100
   compile: true
   emb_dim: 128
 
 
 data:
-  data_path: data/optimal-trajectories-complete.npz
+  # data_path: data/optimal-trajectories-complete.npz
+  data_path: data/optimized_trajectories.npz
   batch_size: 64
   num_workers: 2
   pin_memory: true

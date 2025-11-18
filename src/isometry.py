@@ -7,7 +7,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from src.components.decoder import IDMDecoder
 from src.losses import TemporalVCRegLossOptimized as TemporalVCRegLoss
-from src.components.encoder import MeNet6
+from src.components.encoder import MeNet6, Expander2D, CNNEncoder, MLPHead
 from src.losses import VCRegLoss
 
 
@@ -29,23 +29,11 @@ class Isometry(L.LightningModule):
         self.save_hyperparameters()
 
         # --- Encoder: small CNN ---
-        self.visual_encoder = MeNet6(input_channels=3)
+        self.visual_encoder = CNNEncoder(input_channels=3)
 
         # --- Head: global pool + MLP with LayerNorm ---
         # FIXED: Added LayerNorm at output for stability
-        self.head = nn.Sequential(
-            nn.Flatten(),              # (B, 32)
-            nn.LayerNorm(32*4*4),
-            nn.Linear(32*4*4, emb_dim),
-            nn.GELU(),
-            nn.Linear(emb_dim, emb_dim),
-        )
-        # self.proj = nn.Linear(emb_dim, emb_dim*2) # For VCReg
-        self.vcreg = TemporalVCRegLoss()
-
-        # Assuming uniform time steps of 1 between frames
-        self.mu = horizon / 2.0
-        self.std = horizon / 3.46
+        self.head = MLPHead(emb_dim=emb_dim)#, spatial_features=32*4*4)
 
         if compile:
             self.visual_encoder = torch.compile(self.visual_encoder)
@@ -59,48 +47,74 @@ class Isometry(L.LightningModule):
         
         # Reshape for encoding
         B, T, C, H, W = frames.shape
-        frames = frames.view(B * T, C, H, W)
+        frames = frames.flatten(0, 1)  # (B*T, C, H, W)
         z_frames = self.visual_encoder(frames)  # (B*T, D_enc)
+
+        
         h = self.head(z_frames)  # (B*T, D_emb)
 
         # Reshape back to (B, T, D)
         D = h.shape[-1]
         h = h.view(B, T, D)
 
-        # Apply Temporal VCReg Loss
-        vcreg_loss = self.vcreg(h)
-
-        # Compute pairwise distances
+        # Compute pairwise distances (L2)
         state_pairs = self.unique_state_pairs(h)  # (B, N_pairs, 2, D)
         h_i = state_pairs[:, :, 0, :]  # (B, N_pairs, D)
         h_j = state_pairs[:, :, 1, :]  # (B, N_pairs, D)
-        distances = (h_i - h_j).pow(2).sum(dim=-1)  # (B, N_pairs)
+        distances = torch.sqrt((h_i - h_j).pow(2).sum(dim=-1) + 1e-8)  # (B, N_pairs)
 
-        # Compute target distances
+        # Compute target distances (temporal differences)
         time_indices = torch.arange(T, device=self.device, dtype=distances.dtype)  # (T,)
         # Expand to (1, T)
         time_indices = time_indices.unsqueeze(0)  # (1, T)
         time_pairs = self.unique_state_pairs(time_indices.unsqueeze(-1))  # (1, N_pairs, 2, 1)
         t_i = time_pairs[:, :, 0, 0]  # (1, N_pairs)
         t_j = time_pairs[:, :, 1, 0]  # (1, N_pairs)
-        target_distances = (t_i - t_j).pow(2)  # (1, N_pairs)
+        target_distances = (t_i - t_j).abs().to(dtype=distances.dtype)  # (1, N_pairs)
+        
+        # Normalize both distances and targets to unit vectors for cosine similarity
+        distances_norm = F.normalize(distances, dim=-1)  # (B, N_pairs)
+        target_distances_norm = F.normalize(target_distances, dim=-1)  # (1, N_pairs)
+        
+        # Compute cosine similarity loss (1 - cosine similarity)
+        # Cosine similarity ranges from -1 to 1, so (1 - cos) ranges from 0 to 2
+        cosine_sim = (distances_norm * target_distances_norm).sum(dim=-1)  # (B,)
+        isometry_loss = (1 - cosine_sim).mean()
 
-        # Normalize target distances
-        target_distances = (target_distances - self.mu) / self.std
-        distances = (distances - self.mu) / self.std
 
-        # Compute loss
-        isometry_loss = (distances - target_distances).pow(2).mean()
+        # # # ----------------------------------------------------------------------
+        # # # 2. SOFT RANKING LOSS (global ordering)
+        # # # ----------------------------------------------------------------------
+        # distances_sqrt = torch.sqrt(distances + 1e-8)  # (B, N_pairs)
+        # B, N = distances_sqrt.shape
+        # K = min(2048, N // 4)                 # number of pair-to-pair samples
 
-        total_loss = isometry_loss + vcreg_loss['loss'] * 1e-1
+        # # random pair-of-pair indices
+        # idx1 = torch.randint(0, N, (K,), device=self.device)
+        # idx2 = torch.randint(0, N, (K,), device=self.device)
+
+        # d1 = distances_sqrt[:, idx1]          # (B, K)
+        # d2 = distances_sqrt[:, idx2]          # (B, K)
+
+        # t1 = target_distances[:, idx1]              # (1, K)
+        # t2 = target_distances[:, idx2]              # (1, K)
+
+        # # label: 1 if t1 > t2 else 0
+        # labels = (t1 > t2).to(dtype=distances.dtype)  # (1, K)
+        # labels = labels.expand(B, K)
+
+        # # soft ranking: logits = d1 - d2
+        # logits = d1 - d2
+        # rank_loss = F.binary_cross_entropy_with_logits(logits, labels)
+
+        total_loss = isometry_loss# + rank_loss
         
 
         return {
+            "lr": self.trainer.optimizers[0].param_groups[0]["lr"],
             "loss": total_loss,
             "isometry_loss": isometry_loss,
-            "vcreg_loss": vcreg_loss['loss'],
-            "vcreg_var": vcreg_loss['var-loss'],
-            "vcreg_cov": vcreg_loss['cov-loss'],
+            # "rank_loss": rank_loss,
         }
 
     def training_step(self, batch, batch_idx):
@@ -149,15 +163,32 @@ class Isometry(L.LightningModule):
             if step < self.hparams.warmup_steps:
                 return (step + 1) / float(self.hparams.warmup_steps)
 
-            # After warmup: cosine decay, but only if max_steps is set > warmup_steps
-            total_steps = getattr(self.trainer, "max_steps", -1)
+            # After warmup: cosine decay
+            # Try to get total_steps from trainer
+            total_steps = getattr(self.trainer, "max_steps", None)
+            
+            # If max_steps not set, calculate from max_epochs
+            if total_steps is None or total_steps == -1:
+                max_epochs = getattr(self.trainer, "max_epochs", None)
+                if max_epochs is not None and hasattr(self.trainer, "estimated_stepping_batches"):
+                    # Lightning 2.0+ has this property
+                    total_steps = self.trainer.estimated_stepping_batches
+                elif max_epochs is not None:
+                    # Estimate based on current epoch
+                    if self.trainer.num_training_batches != float('inf'):
+                        total_steps = max_epochs * self.trainer.num_training_batches
+                    else:
+                        total_steps = None
+            
+            # If we still don't have total_steps, keep constant LR after warmup
             if total_steps is None or total_steps <= self.hparams.warmup_steps:
-                # Fallback: keep LR constant after warmup
+                print(f"Warning: Could not determine total_steps (got {total_steps}), keeping LR constant after warmup")
                 return 1.0
 
             progress = (step - self.hparams.warmup_steps) / max(
                 1, (total_steps - self.hparams.warmup_steps)
             )
+            progress = min(1.0, progress)  # Cap at 1.0
             min_ratio = self.hparams.final_lr / self.hparams.initial_lr
             return max(min_ratio, 0.5 * (1 + math.cos(math.pi * progress)))
 
@@ -167,4 +198,3 @@ class Isometry(L.LightningModule):
         }
 
         return [optimizer], [scheduler]
-
