@@ -43,79 +43,42 @@ class Isometry(L.LightningModule):
     def shared_step(self, batch):
         # Assuming batch = (states, frames, actions)
         _, frames, _ = batch
-
-        
         # Reshape for encoding
         B, T, C, H, W = frames.shape
-        frames = frames.flatten(0, 1)  # (B*T, C, H, W)
-        z_frames = self.visual_encoder(frames)  # (B*T, D_enc)
-
-        
-        h = self.head(z_frames)  # (B*T, D_emb)
-
+        frames = frames.flatten(0, 1) # (B*T, C, H, W)
+        z_frames = self.visual_encoder(frames) # (B*T, D_enc)
+        h = self.head(z_frames) # (B*T, D_emb)
         # Reshape back to (B, T, D)
         D = h.shape[-1]
         h = h.view(B, T, D)
-
         # Compute pairwise distances (L2)
-        state_pairs = self.unique_state_pairs(h)  # (B, N_pairs, 2, D)
-        h_i = state_pairs[:, :, 0, :]  # (B, N_pairs, D)
-        h_j = state_pairs[:, :, 1, :]  # (B, N_pairs, D)
-        distances = torch.sqrt((h_i - h_j).pow(2).sum(dim=-1) + 1e-8)  # (B, N_pairs)
-
+        state_pairs = self.unique_state_pairs(h) # (B, N_pairs, 2, D)
+        h_i = state_pairs[:, :, 0, :] # (B, N_pairs, D)
+        h_j = state_pairs[:, :, 1, :] # (B, N_pairs, D)
+        distances = torch.sqrt((h_i - h_j).pow(2).sum(dim=-1) + 1e-8) # (B, N_pairs)
         # Compute target distances (temporal differences)
-        time_indices = torch.arange(T, device=self.device, dtype=distances.dtype)  # (T,)
+        time_indices = torch.arange(T, device=self.device, dtype=distances.dtype) # (T,)
         # Expand to (1, T)
-        time_indices = time_indices.unsqueeze(0)  # (1, T)
-        time_pairs = self.unique_state_pairs(time_indices.unsqueeze(-1))  # (1, N_pairs, 2, 1)
-        t_i = time_pairs[:, :, 0, 0]  # (1, N_pairs)
-        t_j = time_pairs[:, :, 1, 0]  # (1, N_pairs)
-        target_distances = (t_i - t_j).abs().to(dtype=distances.dtype)  # (1, N_pairs)
-        
+        time_indices = time_indices.unsqueeze(0) # (1, T)
+        time_pairs = self.unique_state_pairs(time_indices.unsqueeze(-1)) # (1, N_pairs, 2, 1)
+        t_i = time_pairs[:, :, 0, 0] # (1, N_pairs)
+        t_j = time_pairs[:, :, 1, 0] # (1, N_pairs)
+        target_distances = (t_i - t_j).abs().to(dtype=distances.dtype) # (1, N_pairs)
         # Normalize both distances and targets to unit vectors for cosine similarity
-        distances_norm = F.normalize(distances, dim=-1)  # (B, N_pairs)
-        target_distances_norm = F.normalize(target_distances, dim=-1)  # (1, N_pairs)
-        
+        distances_norm = F.normalize(distances, dim=-1) # (B, N_pairs)
+        target_distances_norm = F.normalize(target_distances, dim=-1) # (1, N_pairs)
         # Compute cosine similarity loss (1 - cosine similarity)
         # Cosine similarity ranges from -1 to 1, so (1 - cos) ranges from 0 to 2
-        cosine_sim = (distances_norm * target_distances_norm).sum(dim=-1)  # (B,)
+        cosine_sim = (distances_norm * target_distances_norm).sum(dim=-1) # (B,)
         isometry_loss = (1 - cosine_sim).mean()
-
-
-        # # # ----------------------------------------------------------------------
-        # # # 2. SOFT RANKING LOSS (global ordering)
-        # # # ----------------------------------------------------------------------
-        # distances_sqrt = torch.sqrt(distances + 1e-8)  # (B, N_pairs)
-        # B, N = distances_sqrt.shape
-        # K = min(2048, N // 4)                 # number of pair-to-pair samples
-
-        # # random pair-of-pair indices
-        # idx1 = torch.randint(0, N, (K,), device=self.device)
-        # idx2 = torch.randint(0, N, (K,), device=self.device)
-
-        # d1 = distances_sqrt[:, idx1]          # (B, K)
-        # d2 = distances_sqrt[:, idx2]          # (B, K)
-
-        # t1 = target_distances[:, idx1]              # (1, K)
-        # t2 = target_distances[:, idx2]              # (1, K)
-
-        # # label: 1 if t1 > t2 else 0
-        # labels = (t1 > t2).to(dtype=distances.dtype)  # (1, K)
-        # labels = labels.expand(B, K)
-
-        # # soft ranking: logits = d1 - d2
-        # logits = d1 - d2
-        # rank_loss = F.binary_cross_entropy_with_logits(logits, labels)
-
-        total_loss = isometry_loss# + rank_loss
         
-
+        total_loss = isometry_loss
+        
         return {
             "lr": self.trainer.optimizers[0].param_groups[0]["lr"],
-            "loss": total_loss,
-            "isometry_loss": isometry_loss,
-            # "rank_loss": rank_loss,
+            "loss": total_loss, "isometry_loss": isometry_loss
         }
+
 
     def training_step(self, batch, batch_idx):
         losses = self.shared_step(batch)
