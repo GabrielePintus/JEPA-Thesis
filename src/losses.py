@@ -18,7 +18,7 @@ class VCRegLoss(nn.Module):
         self.cov_coeff = cov_coeff
         self.gamma = gamma
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Computes the VICReg loss.
 
         ---
@@ -34,14 +34,8 @@ class VCRegLoss(nn.Module):
                 Dictionary where values are of shape of [1,].
         """
         metrics = dict()
-        metrics["var-loss"] = (
-            self.var_coeff
-            * (self.variance_loss(x, self.gamma) + self.variance_loss(y, self.gamma))
-            / 2
-        )
-        metrics["cov-loss"] = (
-            self.cov_coeff * (self.covariance_loss(x) + self.covariance_loss(y)) / 2
-        )
+        metrics["var-loss"] = self.var_coeff * self.variance_loss(x, self.gamma)
+        metrics["cov-loss"] = self.cov_coeff * self.covariance_loss(x)
         metrics["loss"] = sum(metrics.values())
         return metrics
 
@@ -67,11 +61,8 @@ class VCRegLoss(nn.Module):
                 Shape of [1,].
         """
         x = x - x.mean(dim=0)
-        print(x.shape)
         std = x.std(dim=0)
-        print(std.shape)
         var_loss = F.relu(gamma - std)
-        print(var_loss.shape)
         var_loss = var_loss.mean()
         return var_loss
 

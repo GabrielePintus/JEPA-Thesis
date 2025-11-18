@@ -143,8 +143,12 @@ class PointMazeSequences(Dataset):
     ):
         super().__init__()
         data = np.load(npz_path)
-        self.obs = data["obs"].astype(np.float32)      # (E, T+1, D)
-        self.act = data["act"].astype(np.float32)      # (E, T, A)
+        try:
+            self.obs = data["obs"].astype(np.float32)      # (E, T+1, D)
+            self.act = data["act"].astype(np.float32)      # (E, T, A)
+        except KeyError as e:
+            self.obs = data["states"].astype(np.float32)  # (E, T+1, D)
+            self.act = data["actions"].astype(np.float32)       # (E, T
         self.frames = data.get("frames", None)
         if self.frames is not None:
             self.frames = self.frames.astype(np.uint8)

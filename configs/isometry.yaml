@@ -1,0 +1,51 @@
+trainer:
+  max_epochs: 500
+  accelerator: gpu
+  devices: 1
+  num_nodes: 1
+  strategy: ddp_find_unused_parameters_false
+  precision: bf16-mixed
+  # gradient clipping
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  # gradient accumulation (accumulate gradients for N steps before optimizer step)
+  accumulate_grad_batches: 4
+  callbacks:
+  - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+    init_args:
+      dirpath: checkpoints/isometry
+      filename: "Isometry-{epoch:03d}-{val/loss:.4f}"
+      monitor: val/loss
+      mode: min
+      save_top_k: 1                        # best checkpoint
+      save_last: true                      # plus a copy of the final epoch
+      auto_insert_metric_name: false       # keep filename clean
+      every_n_epochs: 1
+      save_on_train_epoch_end: true
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: "JEPA"
+      name: "PointMaze/Isometry"
+      log_model: true
+
+
+model:
+  initial_lr: 5e-4
+  final_lr: 1e-6
+  weight_decay: 1e-4
+  warmup_steps: 100
+  compile: true
+  emb_dim: 128
+
+
+data:
+  data_path: data/optimal-trajectories-complete.npz
+  batch_size: 64
+  num_workers: 2
+  pin_memory: true
+  val_size: 0.1
+  seq_len: 50
+  stride: 10
+  normalize: false
+

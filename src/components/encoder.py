@@ -15,27 +15,51 @@ class MeNet6(nn.Module):
         self.activation = nn.ReLU()
 
         self.net = nn.Sequential(
-            nn.Conv2d(input_channels, 16, kernel_size=5, stride=1),
+            nn.Conv2d(input_channels, 16, kernel_size=5, stride=1), # (16, 60, 60)
             nn.GroupNorm(4, 16, eps=1e-05, affine=True),
             self.activation,
 
-            nn.Conv2d(16, 32, kernel_size=5, stride=2),
+            nn.Conv2d(16, 32, kernel_size=5, stride=2), # (32, 28, 28)
             nn.GroupNorm(8, 32, eps=1e-05, affine=True),
             self.activation,
 
-            nn.Conv2d(32, 32, kernel_size=3, stride=1),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1), # (32, 28, 28)
             nn.GroupNorm(8, 32, eps=1e-05, affine=True),
             self.activation,
 
-            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, 32, eps=1e-05, affine=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=0), # (64, 26, 26)
+            nn.GroupNorm(8, 64, eps=1e-05, affine=True),
             self.activation,
 
-            nn.Conv2d(32, 16, kernel_size=1, stride=1),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=0), # (64, 12, 12)
+            nn.GroupNorm(8, 64, eps=1e-05, affine=True),
+            self.activation,
+
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=0), # (32, 10, 10)
+            nn.MaxPool2d(kernel_size=3, stride=2),                     # (32, 4, 4)
         )
 
     def forward(self, x):
         return self.net(x)
+
+
+class CNNEncoder(nn.Module):
+    """A simple CNN encoder that processes images into feature maps."""
+    def __init__(self, input_channels=3, feature_dim=32):
+        super().__init__()
+        self.activation = nn.GELU()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(input_channels, 16, kernel_size=5, stride=1), # 
+            nn.GroupNorm(4, 16, eps=1e-05, affine=True),
+            self.activation,
+
+
+        )
+
+    def forward(self, x):
+        return self.encoder(x)
+
+
 
 class Expander2D(nn.Module):
     """Expands a low-dimensional proprioceptive vector into a 2D feature map and applies BatchNorm1d before expansion."""
