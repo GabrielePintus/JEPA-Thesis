@@ -22,12 +22,12 @@ trainer:
       auto_insert_metric_name: false       # keep filename clean
       every_n_epochs: 1
       save_on_train_epoch_end: true
-  logger:
-    class_path: lightning.pytorch.loggers.WandbLogger
-    init_args:
-      project: "JEPA"
-      name: "PointMaze/Isometry"
-      log_model: true
+  # logger:
+  #   class_path: lightning.pytorch.loggers.WandbLogger
+  #   init_args:
+  #     project: "JEPA"
+  #     name: "PointMaze/Isometry"
+  #     log_model: true
 
 
 model:
@@ -35,8 +35,9 @@ model:
   final_lr: 1e-6
   weight_decay: 1e-5
   warmup_steps: 100
-  compile: true
+  compile: false
   emb_dim: 128
+  num_samples_std: 8
 
 
 data:

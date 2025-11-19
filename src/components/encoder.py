@@ -59,10 +59,10 @@ class CNNEncoder(nn.Module):
         self.block1 = self._make_residual_block(base_channels, base_channels*2, stride=2)
         # (B, 64, 32, 32)
         
-        self.block2 = self._make_residual_block(base_channels*2, base_channels*4, stride=2)
+        self.block2 = self._make_residual_block(base_channels*2, base_channels*3, stride=2)
         # (B, 128, 16, 16)
         
-        self.block3 = self._make_residual_block(base_channels*4, base_channels*4, stride=2)
+        self.block3 = self._make_residual_block(base_channels*3, base_channels*4, stride=2)
         # (B, 128, 8, 8)
         
         # Don't pool too aggressively - keep 8×8 spatial structure
@@ -97,9 +97,8 @@ class MLPHead(nn.Module):
         self.head = nn.Sequential(
             nn.Flatten(),
             nn.LayerNorm(spatial_features),
-            nn.Linear(spatial_features, emb_dim * 2),
-            nn.GELU(),
-            nn.Linear(emb_dim * 2, emb_dim),
+            nn.Dropout(0.1),
+            nn.Linear(spatial_features, emb_dim),
             nn.GELU(),
             nn.Linear(emb_dim, emb_dim),
         )

@@ -23,6 +23,7 @@ class Isometry(L.LightningModule):
         emb_dim: int = 128,
         horizon: int = 10,
         compile: bool = False,
+        num_samples_std: int = 8,
     ):
         super().__init__()
 
@@ -34,49 +35,98 @@ class Isometry(L.LightningModule):
         # --- Head: global pool + MLP with LayerNorm ---
         # FIXED: Added LayerNorm at output for stability
         self.head = MLPHead(emb_dim=emb_dim)#, spatial_features=32*4*4)
+        self.logstd_head = nn.Sequential(
+            nn.LayerNorm(emb_dim*2),
+            nn.Linear(emb_dim*2, emb_dim),
+            nn.ReLU(),
+            nn.Linear(emb_dim, 1),
+        )
 
         if compile:
             self.visual_encoder = torch.compile(self.visual_encoder)
             self.head = torch.compile(self.head)
+            self.logstd_head = torch.compile(self.logstd_head)
 
 
     def shared_step(self, batch):
         # Assuming batch = (states, frames, actions)
         _, frames, _ = batch
-        # Reshape for encoding
         B, T, C, H, W = frames.shape
-        frames = frames.flatten(0, 1) # (B*T, C, H, W)
-        z_frames = self.visual_encoder(frames) # (B*T, D_enc)
-        h = self.head(z_frames) # (B*T, D_emb)
-        # Reshape back to (B, T, D)
-        D = h.shape[-1]
-        h = h.view(B, T, D)
-        # Compute pairwise distances (L2)
-        state_pairs = self.unique_state_pairs(h) # (B, N_pairs, 2, D)
-        h_i = state_pairs[:, :, 0, :] # (B, N_pairs, D)
-        h_j = state_pairs[:, :, 1, :] # (B, N_pairs, D)
-        distances = torch.sqrt((h_i - h_j).pow(2).sum(dim=-1) + 1e-8) # (B, N_pairs)
+        
+        # Encode frames once
+        frames_flat = frames.flatten(0, 1)  # (B*T, C, H, W)
+        z_frames = self.visual_encoder(frames_flat)  # (B*T, D_enc)
+        
+        # Sample multiple embeddings using dropout
+        num_samples = self.hparams.num_samples_std
+        distance_samples = []
+        
+        for _ in range(num_samples):
+            h = self.head(z_frames)  # (B*T, D_emb) - dropout active
+            h = h.view(B, T, -1)  # (B, T, D)
+            
+            # Compute pairwise distances for this sample
+            state_pairs = self.unique_state_pairs(h)
+            h_i = state_pairs[:, :, 0, :]
+            h_j = state_pairs[:, :, 1, :]
+            distances = torch.sqrt((h_i - h_j).pow(2).sum(dim=-1) + 1e-8)  # (B, N_pairs)
+            
+            # Normalize for cosine similarity
+            distances_norm = F.normalize(distances, dim=-1)  # (B, N_pairs)
+            distance_samples.append(distances_norm)
+        
+        # Stack samples: (num_samples, B, N_pairs)
+        distance_samples = torch.stack(distance_samples, dim=0)
+        
+        # Compute mean and std of DISTANCE predictions
+        distances_mean = distance_samples.mean(dim=0)  # (B, N_pairs)
+        distances_std = distance_samples.std(dim=0)    # (B, N_pairs)
+        
+        # Get one more forward pass for logstd prediction
+        h_for_logstd = self.head(z_frames).view(B, T, -1)  # (B, T, D)
+        
+        # Compute state pairs for logstd prediction
+        state_pairs_logstd = self.unique_state_pairs(h_for_logstd)  # (B, N_pairs, 2, D)
+        # Concatenate the pair embeddings
+        h_pairs = state_pairs_logstd.view(B, -1, 2 * h_for_logstd.shape[-1])  # (B, N_pairs, 2*D)
+        
+        # Predict log std for each pair
+        B_size, N_pairs, pair_dim = h_pairs.shape
+        h_pairs_flat = h_pairs.view(B_size * N_pairs, pair_dim)
+        print(h_pairs_flat.shape)
+        logstd_pred = self.logstd_head(h_pairs_flat).squeeze(-1)  # (B*N_pairs,)
+        logstd_pred = logstd_pred.view(B_size, N_pairs)  # (B, N_pairs)
+        
+        # Compute target logstd from sampled distances
+        logstd_target = torch.log(distances_std + 1e-8)  # (B, N_pairs)
+        
+        # LogStd regression loss
+        print(logstd_pred.shape, logstd_target.shape)
+        logstd_loss = F.mse_loss(logstd_pred, logstd_target)
+        
         # Compute target distances (temporal differences)
-        time_indices = torch.arange(T, device=self.device, dtype=distances.dtype) # (T,)
-        # Expand to (1, T)
-        time_indices = time_indices.unsqueeze(0) # (1, T)
-        time_pairs = self.unique_state_pairs(time_indices.unsqueeze(-1)) # (1, N_pairs, 2, 1)
-        t_i = time_pairs[:, :, 0, 0] # (1, N_pairs)
-        t_j = time_pairs[:, :, 1, 0] # (1, N_pairs)
-        target_distances = (t_i - t_j).abs().to(dtype=distances.dtype) # (1, N_pairs)
-        # Normalize both distances and targets to unit vectors for cosine similarity
-        distances_norm = F.normalize(distances, dim=-1) # (B, N_pairs)
-        target_distances_norm = F.normalize(target_distances, dim=-1) # (1, N_pairs)
-        # Compute cosine similarity loss (1 - cosine similarity)
-        # Cosine similarity ranges from -1 to 1, so (1 - cos) ranges from 0 to 2
-        cosine_sim = (distances_norm * target_distances_norm).sum(dim=-1) # (B,)
+        time_indices = torch.arange(T, device=self.device, dtype=distances_mean.dtype)
+        time_indices = time_indices.unsqueeze(0)
+        time_pairs = self.unique_state_pairs(time_indices.unsqueeze(-1))
+        t_i = time_pairs[:, :, 0, 0]
+        t_j = time_pairs[:, :, 1, 0]
+        target_distances = (t_i - t_j).abs().to(dtype=distances_mean.dtype)
+        target_distances_norm = F.normalize(target_distances, dim=-1)
+        
+        # Isometry loss using mean distances
+        cosine_sim = (distances_mean * target_distances_norm).sum(dim=-1)
         isometry_loss = (1 - cosine_sim).mean()
         
-        total_loss = isometry_loss
+        # Combined loss
+        total_loss = isometry_loss + logstd_loss * 1e-2
         
         return {
             "lr": self.trainer.optimizers[0].param_groups[0]["lr"],
-            "loss": total_loss, "isometry_loss": isometry_loss
+            "loss": total_loss,
+            "isometry_loss": isometry_loss,
+            "logstd_loss": logstd_loss,
+            "mean_distance_std": distances_std.mean(),  # Monitor average prediction uncertainty
+            "max_distance_std": distances_std.max(),    # Monitor maximum uncertainty
         }
 
 
