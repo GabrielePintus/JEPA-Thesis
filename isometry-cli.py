@@ -2,8 +2,10 @@ import torch
 from lightning.pytorch.cli import LightningCLI
 from src.data.datamodule import PointMazeSequencesDataModule
 from src.isometry import Isometry
+import os
 
 SEED = 0
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 if __name__ == "__main__":

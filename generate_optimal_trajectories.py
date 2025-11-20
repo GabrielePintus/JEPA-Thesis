@@ -162,6 +162,10 @@ def sample_goal_and_start(env, min_separation=1.0):
     for _ in range(max_attempts):
         initial_pos = sample_valid_position(env)
         goal_pos = sample_valid_position(env)
+
+        # Add noise to initial and goal positions
+        initial_pos += np.random.uniform(-0.15, 0.15, size=(2,))
+        goal_pos += np.random.uniform(-0.15, 0.15, size=(2,))
         
         # Check if they are sufficiently separated
         distance = np.linalg.norm(initial_pos - goal_pos)

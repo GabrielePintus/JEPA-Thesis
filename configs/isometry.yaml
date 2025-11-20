@@ -9,7 +9,7 @@ trainer:
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   # gradient accumulation (accumulate gradients for N steps before optimizer step)
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 6
   callbacks:
   - class_path: lightning.pytorch.callbacks.ModelCheckpoint
     init_args:
@@ -22,12 +22,12 @@ trainer:
       auto_insert_metric_name: false       # keep filename clean
       every_n_epochs: 1
       save_on_train_epoch_end: true
-  # logger:
-  #   class_path: lightning.pytorch.loggers.WandbLogger
-  #   init_args:
-  #     project: "JEPA"
-  #     name: "PointMaze/Isometry"
-  #     log_model: true
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: "JEPA"
+      name: "PointMaze/Isometry"
+      log_model: true
 
 
 model:
@@ -35,7 +35,7 @@ model:
   final_lr: 1e-6
   weight_decay: 1e-5
   warmup_steps: 100
-  compile: false
+  compile: true
   emb_dim: 128
   num_samples_std: 8
 
@@ -43,11 +43,11 @@ model:
 data:
   # data_path: data/optimal-trajectories-complete.npz
   data_path: data/optimized_trajectories.npz
-  batch_size: 32
+  batch_size: 16
   num_workers: 2
   pin_memory: true
   val_size: 0.1
-  seq_len: 100
-  # stride: 10
+  seq_len: 50
+  stride: 10
   normalize: false
 

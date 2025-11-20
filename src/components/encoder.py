@@ -13,6 +13,7 @@ class MeNet6(nn.Module):
     def __init__(self, input_channels=3):
         super().__init__()
         self.activation = nn.ReLU()
+        # self.activation = nn.GELU()
 
         self.net = nn.Sequential(
             nn.Conv2d(input_channels, 16, kernel_size=5, stride=1), # (16, 60, 60)
@@ -27,16 +28,7 @@ class MeNet6(nn.Module):
             nn.GroupNorm(8, 32, eps=1e-05, affine=True),
             self.activation,
 
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=0), # (64, 26, 26)
-            nn.GroupNorm(8, 64, eps=1e-05, affine=True),
-            self.activation,
-
-            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=0), # (64, 12, 12)
-            nn.GroupNorm(8, 64, eps=1e-05, affine=True),
-            self.activation,
-
-            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=0), # (32, 10, 10)
-            nn.MaxPool2d(kernel_size=3, stride=2),                     # (32, 4, 4)
+            nn.Conv2d(32, 16, kernel_size=3, stride=1, padding=0), # (64, 26, 26)
         )
 
     def forward(self, x):
@@ -62,7 +54,7 @@ class CNNEncoder(nn.Module):
         self.block2 = self._make_residual_block(base_channels*2, base_channels*3, stride=2)
         # (B, 128, 16, 16)
         
-        self.block3 = self._make_residual_block(base_channels*3, base_channels*4, stride=2)
+        self.block3 = self._make_residual_block(base_channels*3, base_channels*3, stride=2)
         # (B, 128, 8, 8)
         
         # Don't pool too aggressively - keep 8×8 spatial structure
@@ -91,7 +83,7 @@ class CNNEncoder(nn.Module):
         return x3  # (B, 128, 8, 8)
 
 class MLPHead(nn.Module):
-    def __init__(self, spatial_features=128*8*8, emb_dim=256):
+    def __init__(self, spatial_features=96*8*8, emb_dim=256):
         super().__init__()
         
         self.head = nn.Sequential(

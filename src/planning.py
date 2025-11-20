@@ -104,6 +104,15 @@ class ValueFunctionWrapper:
         # Cosine similarity distance: 1 - cos_sim
         # We want to maximize similarity (minimize distance)
         distances = 1 - F.cosine_similarity(z_frames, self.goal_embedding)
+
+        # If there is std prediction, we could incorporate it here (optional)
+        if hasattr(self.model, 'logstd_head'):
+            # Prepare input for std prediction
+            std_in = torch.cat([z_frames, self.goal_embedding.repeat(z_frames.size(0), 1)], dim=1)
+            logstd_pred = self.model.logstd_head(std_in).squeeze(-1)
+            std_pred = logstd_pred.exp()
+            # Optionally adjust distance by uncertainty (e.g., distance / std)
+            distances = distances * (1 + std_pred * 5e-1)  # Weight uncertainty
         
         # Return negative distance (value = -distance)
         return -distances
@@ -166,8 +175,9 @@ class EnvironmentRollout:
         
         # Execute actions
         for action in actions:
-            _, _, _, _ = self.env.step(action)
-            pos = self.env.get_position()
+            obs_dict, _, _, _, _ = self.env.step(action)
+            # pos = self.env.get_position()
+            pos = obs_dict['observation'][:2]  # Assuming first two entries are (x, y)
             positions.append(pos)
             
             if return_frames:
@@ -432,7 +442,7 @@ class CMAESPlanner:
         
         # Convert final frame to tensor
         final_frame = frames[-1]
-        frame_tensor = torch.from_numpy(final_frame).permute(2, 0, 1).float() / 255.0
+        frame_tensor = torch.from_numpy(final_frame.copy()).permute(2, 0, 1).float() / 255.0
         frame_tensor = frame_tensor.unsqueeze(0).to(self.config.device)
         
         # Compute value
