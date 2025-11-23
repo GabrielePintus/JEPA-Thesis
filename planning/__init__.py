@@ -86,9 +86,9 @@ Channel Masking:
 """
 
 from .base_planner import BasePlanner, LatentRollout
-from .gradient_planner import GradientPlanner, GradientPlannerWithMomentum
-from .cmaes_planner import CMAESPlanner, CMAESPlannerImproved
-from .mppi_planner import MPPIPlanner, MPPIPlannerWithElites
+from .gradient_planner import GradientPlanner
+from .cmaes_planner import CMAESPlanner
+from .mppi_planner import MPPIPlanner
 from .mpc_controller import MPCController
 
 __all__ = [

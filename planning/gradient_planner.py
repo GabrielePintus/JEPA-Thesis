@@ -1,19 +1,28 @@
 """
 Gradient-based trajectory optimization using Adam optimizer.
 Optimizes action sequences by backpropagating through the latent dynamics model.
+
+Features:
+- Adam optimizer with configurable learning rate
+- Optional noise injection for escaping local minima (wider basins of attraction)
+- Gradient clipping for stability
+- Progress tracking with tqdm
 """
 
 import torch
-import torch.nn as nn
 from typing import Optional, Dict, Any, Tuple
 from tqdm import tqdm
-from .base_planner import BasePlanner
+
+from .base_planner import BasePlanner, CostConfig
 
 
 class GradientPlanner(BasePlanner):
     """
-    Gradient-based planner using Adam optimizer.
-    Optimizes actions by computing gradients through the JEPA predictor.
+    Gradient-based planner using Adam optimizer with optional noise regularization.
+    
+    The noise injection helps escape local minima and find wider basins of attraction
+    in the cost landscape. This can be seen as a form of simulated annealing or
+    stochastic gradient descent with explicit noise.
     """
     
     def __init__(
@@ -23,10 +32,16 @@ class GradientPlanner(BasePlanner):
         action_bounds: Tuple[float, float] = (-1.0, 1.0),
         channel_mask: Optional[torch.Tensor] = None,
         device: str = 'cuda',
-        discount: float = 0.99,
-        lr: float = 0.01,
+        cost_config: Optional[CostConfig] = None,
+        # Optimization parameters
+        initial_lr: float = 0.1,
+        final_lr: Optional[float] = None,
         num_iterations: int = 100,
         grad_clip: Optional[float] = 1.0,
+        # Noise regularization
+        noise_std: float = 0.0,
+        noise_decay: float = 0.995,
+        min_noise: float = 0.0,
     ):
         """
         Args:
@@ -35,10 +50,13 @@ class GradientPlanner(BasePlanner):
             action_bounds: (min, max) bounds for actions
             channel_mask: Optional mask for cost computation
             device: Device to run on
-            discount: Discount factor for trajectory cost
+            cost_config: Cost function configuration
             lr: Learning rate for Adam optimizer
             num_iterations: Number of optimization iterations
             grad_clip: Gradient clipping value (None to disable)
+            noise_std: Initial standard deviation of noise added to actions
+            noise_decay: Decay rate for noise per iteration
+            min_noise: Minimum noise standard deviation
         """
         super().__init__(
             jepa_model=jepa_model,
@@ -46,12 +64,16 @@ class GradientPlanner(BasePlanner):
             action_bounds=action_bounds,
             channel_mask=channel_mask,
             device=device,
-            discount=discount,
+            cost_config=cost_config,
         )
         
-        self.lr = lr
+        self.initial_lr = initial_lr
+        self.final_lr = final_lr if final_lr is not None else initial_lr
         self.num_iterations = num_iterations
         self.grad_clip = grad_clip
+        self.noise_std = noise_std
+        self.noise_decay = noise_decay
+        self.min_noise = min_noise
         
     def _initialize_actions(
         self,
@@ -60,8 +82,7 @@ class GradientPlanner(BasePlanner):
     ) -> torch.Tensor:
         """Initialize action sequence."""
         if initial_actions is not None:
-            # Warm-start from provided actions
-            actions = initial_actions.clone().detach()
+            actions = initial_actions.clone().detach().to(self.device)
             if len(actions) < horizon:
                 # Pad with zeros if too short
                 padding = torch.zeros(
@@ -84,153 +105,41 @@ class GradientPlanner(BasePlanner):
         
         return actions
     
-    def optimize(
+    def _validate_inputs(
         self,
         z_init: torch.Tensor,
         z_goal: torch.Tensor,
-        horizon: int,
-        initial_actions: Optional[torch.Tensor] = None,
-        verbose: bool = False,
-        log_frequency: int = 10,
-    ) -> Dict[str, Any]:
-        """
-        Optimize action sequence using gradient descent.
-        
-        Args:
-            z_init: Initial latent state (C, H, W) - should be 18 channels for JEPA
-            z_goal: Goal latent state (C, H, W) - should be 18 channels for JEPA
-            horizon: Planning horizon
-            initial_actions: Optional warm-start actions
-            verbose: Print optimization progress
-            log_frequency: Print every k iterations
-            
-        Returns:
-            Dictionary with optimized actions, trajectory, and cost history
-        """
-        # Validate inputs
+        verbose: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Validate and prepare input latent states."""
+        # Handle extra batch dimensions
         if z_init.dim() == 4 and z_init.shape[0] == 1:
             z_init = z_init.squeeze(0)
-            if verbose:
-                print(f"Squeezed z_init from batch dimension, new shape: {z_init.shape}")
-        
+            
         if z_goal.dim() == 4 and z_goal.shape[0] == 1:
             z_goal = z_goal.squeeze(0)
-            if verbose:
-                print(f"Squeezed z_goal from batch dimension, new shape: {z_goal.shape}")
         
-        # Check channel count
-        if z_init.shape[0] != 18:
+        # Check channel count (expecting 18 = 16 visual + 2 proprio)
+        expected_channels = 18
+        if z_init.shape[0] != expected_channels:
             raise ValueError(
-                f"z_init has {z_init.shape[0]} channels, expected 18 (16 visual + 2 proprio). "
-                f"Make sure you're using model.encode_state(state, frame), not just model.visual_encoder(frame). "
+                f"z_init has {z_init.shape[0]} channels, expected {expected_channels} "
+                f"(16 visual + 2 proprio). Use model.encode_state(state, frame). "
                 f"Got shape: {z_init.shape}"
             )
         
-        if z_goal.shape[0] != 18:
+        if z_goal.shape[0] != expected_channels:
             raise ValueError(
-                f"z_goal has {z_goal.shape[0]} channels, expected 18 (16 visual + 2 proprio). "
-                f"Make sure you're using model.encode_state(state, frame), not just model.visual_encoder(frame). "
+                f"z_goal has {z_goal.shape[0]} channels, expected {expected_channels}. "
                 f"Got shape: {z_goal.shape}"
             )
         
         # Move to device
         z_init = z_init.to(self.device)
         z_goal = z_goal.to(self.device)
-        # Initialize actions
-        actions = self._initialize_actions(horizon, initial_actions)
         
-        # Create optimizer
-        optimizer = torch.optim.Adam([actions], lr=self.lr)
-        
-        # Optimization loop
-        cost_history = []
-        
-        progressbar = tqdm(range(self.num_iterations), disable=not verbose)
-        for iteration in progressbar:
-            optimizer.zero_grad()
-            
-            # Rollout WITH gradients enabled for optimization
-            trajectory = self.rollout.rollout(z_init, actions, enable_grad=True)
-            cost = self.rollout.trajectory_cost(trajectory, z_goal, self.discount)
-            
-            # Backward pass
-            cost.backward()
-            
-            # Gradient clipping
-            if self.grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_([actions], self.grad_clip)
-            
-            # Optimization step
-            optimizer.step()
-            
-            # Project actions to valid bounds
-            # with torch.no_grad():
-            actions.data = self.clip_actions(actions.data)
-            
-            # Log progress
-            cost_val = cost.item()
-            cost_history.append(cost_val)
-            
-            if verbose and (iteration % log_frequency == 0 or iteration == self.num_iterations - 1):
-                grad_norm = actions.grad.norm().item() if actions.grad is not None else 0.0
-                # print(f"Iter {iteration:4d}/{self.num_iterations}: "
-                #       f"Cost = {cost_val:.6f}, Grad norm = {grad_norm:.6f}")
-                progressbar.set_postfix(cost=cost_val, grad_norm=grad_norm)
-        
-        # Final evaluation
-        with torch.no_grad():
-            final_trajectory = self.rollout.rollout(z_init, actions)
-            final_cost = self.rollout.trajectory_cost(final_trajectory, z_goal, self.discount)
-        
-        return {
-            'actions': actions.detach(),
-            'trajectory': final_trajectory.detach(),
-            'cost': final_cost.item(),
-            'cost_history': cost_history,
-            'num_iterations': self.num_iterations,
-        }
-
-
-class GradientPlannerWithMomentum(GradientPlanner):
-    """
-    Enhanced gradient planner with momentum and adaptive learning rate.
-    Uses SGD with momentum instead of Adam for potentially better convergence.
-    """
+        return z_init, z_goal
     
-    def __init__(
-        self,
-        jepa_model,
-        action_dim: int,
-        action_bounds: Tuple[float, float] = (-1.0, 1.0),
-        channel_mask: Optional[torch.Tensor] = None,
-        device: str = 'cuda',
-        discount: float = 0.99,
-        lr: float = 0.01,
-        momentum: float = 0.9,
-        num_iterations: int = 100,
-        grad_clip: Optional[float] = 1.0,
-        lr_decay: float = 0.995,
-    ):
-        """
-        Args:
-            momentum: Momentum coefficient for SGD
-            lr_decay: Learning rate decay per iteration
-        """
-        super().__init__(
-            jepa_model=jepa_model,
-            action_dim=action_dim,
-            action_bounds=action_bounds,
-            channel_mask=channel_mask,
-            device=device,
-            discount=discount,
-            lr=lr,
-            num_iterations=num_iterations,
-            grad_clip=grad_clip,
-        )
-        
-        self.momentum = momentum
-        self.lr_decay = lr_decay
-        
     def optimize(
         self,
         z_init: torch.Tensor,
@@ -238,35 +147,60 @@ class GradientPlannerWithMomentum(GradientPlanner):
         horizon: int,
         initial_actions: Optional[torch.Tensor] = None,
         verbose: bool = False,
-        log_frequency: int = 10,
     ) -> Dict[str, Any]:
-        """Optimize using SGD with momentum and learning rate decay."""
+        """
+        Optimize action sequence using gradient descent with Adam.
+        
+        Args:
+            z_init: Initial latent state (C, H, W) - 18 channels for JEPA
+            z_goal: Goal latent state (C, H, W) - 18 channels for JEPA
+            horizon: Planning horizon
+            initial_actions: Optional warm-start actions
+            verbose: Show progress bar
+            
+        Returns:
+            Dictionary with optimized actions, trajectory, and cost history
+        """
+        # Validate inputs
+        z_init, z_goal = self._validate_inputs(z_init, z_goal, verbose)
+        
         # Initialize actions
         actions = self._initialize_actions(horizon, initial_actions)
         
-        # Create optimizer with momentum
-        optimizer = torch.optim.SGD(
-            [actions],
-            lr=self.lr,
-            momentum=self.momentum
-        )
-        
+        # Create optimizer
+        optimizer = torch.optim.Adam([actions], lr=self.initial_lr)
+
         # Learning rate scheduler
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            optimizer,
-            gamma=self.lr_decay
-        )
+        if self.initial_lr != self.final_lr:
+            lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1.0,
+                end_factor=self.final_lr / self.initial_lr,
+                total_iters=self.num_iterations
+            )
+        
+        # Tracking
+        cost_history = []
+        best_cost = float('inf')
+        best_actions = None
+        current_noise = self.noise_std
         
         # Optimization loop
-        cost_history = []
+        pbar = tqdm(range(self.num_iterations), disable=not verbose, desc="Gradient Opt")
         
-        progressbar = tqdm(range(self.num_iterations), disable=not verbose)
-        for iteration in progressbar:
+        for iteration in pbar:
             optimizer.zero_grad()
             
-            # Rollout WITH gradients enabled for optimization
-            trajectory = self.rollout.rollout(z_init, actions, enable_grad=True)
-            cost = self.rollout.trajectory_cost(trajectory, z_goal, self.discount)
+            # Add noise for regularization (if enabled)
+            if current_noise > 0:
+                noise = torch.randn_like(actions) * current_noise
+                actions_noisy = self.clip_actions(actions + noise)
+            else:
+                actions_noisy = actions
+            
+            # Rollout WITH gradients enabled
+            trajectory = self.rollout.rollout(z_init, actions_noisy, enable_grad=True)
+            cost = self.rollout.total_cost(trajectory, z_goal, actions_noisy, self.cost_config)
             
             # Backward pass
             cost.backward()
@@ -277,38 +211,61 @@ class GradientPlannerWithMomentum(GradientPlanner):
             
             # Optimization step
             optimizer.step()
-            scheduler.step()
             
-            # Project actions to valid bounds
-            # with torch.no_grad():
+            # Project to valid bounds
             actions.data = self.clip_actions(actions.data)
             
-            # Log progress
+            # Track best solution
             cost_val = cost.item()
-            cost_history.append(cost_val)
+            if cost_val < best_cost:
+                best_cost = cost_val
+                best_actions = actions.detach().clone()
             
-            if verbose and (iteration % log_frequency == 0 or iteration == self.num_iterations - 1):
-                current_lr = scheduler.get_last_lr()[0]
+            # Decay noise
+            current_noise = max(self.min_noise, current_noise * self.noise_decay)
+            
+            # Log progress
+            cost_history.append(cost_val)
+
+            # Step learning rate scheduler
+            if self.initial_lr != self.final_lr:
+                lr_scheduler.step()
+            
+            if verbose:
                 grad_norm = actions.grad.norm().item() if actions.grad is not None else 0.0
-                # print(f"Iter {iteration:4d}/{self.num_iterations}: "
-                #       f"Cost = {cost_val:.6f}, LR = {current_lr:.6f}, "
-                #       f"Grad norm = {grad_norm:.6f}")
-                progressbar.set_description(
-                    f"Iter {iteration:4d}/{self.num_iterations}: "
-                    f"Cost = {cost_val:.6f}, LR = {current_lr:.6f}, "
-                    f"Grad norm = {grad_norm:.6f}"
-                )
+                pbar.set_postfix({
+                    'cost': f'{cost_val:.4f}',
+                    'best': f'{best_cost:.4f}',
+                    'grad': f'{grad_norm:.4f}',
+                    'noise': f'{current_noise:.4f}'
+                })
+        
+        # Use best actions found
+        if best_actions is None:
+            best_actions = actions.detach()
         
         # Final evaluation
         with torch.no_grad():
-            final_trajectory = self.rollout.rollout(z_init, actions)
-            final_cost = self.rollout.trajectory_cost(final_trajectory, z_goal, self.discount)
+            final_trajectory = self.rollout.rollout(z_init, best_actions)
+            final_cost = self.rollout.total_cost(
+                final_trajectory, z_goal, best_actions, self.cost_config
+            )
+            
+            # Compute cost breakdown
+            goal_cost = self.rollout.goal_cost(final_trajectory, z_goal)
+            traj_cost = self.rollout.trajectory_cost(final_trajectory, z_goal)
+            smooth_cost = self.rollout.smoothness_cost(
+                best_actions, order=self.cost_config.smoothness_order
+            )
         
         return {
-            'actions': actions.detach(),
+            'actions': best_actions,
             'trajectory': final_trajectory.detach(),
             'cost': final_cost.item(),
             'cost_history': cost_history,
             'num_iterations': self.num_iterations,
-            'final_lr': scheduler.get_last_lr()[0],
+            # Cost breakdown
+            'goal_cost': goal_cost.item(),
+            'trajectory_cost': traj_cost.item(),
+            'smoothness_cost': smooth_cost.item(),
         }

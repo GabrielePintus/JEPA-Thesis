@@ -1,18 +1,47 @@
 """
-Base planner class with common functionality for latent space trajectory optimization.
+Base planner class with modular cost functions for latent space trajectory optimization.
 Provides the interface and shared utilities for all planning algorithms.
+
+Cost Function Design:
+- goal_cost: Distance from final predicted state to goal (penalizes not reaching goal)
+- trajectory_cost: Sum of distances along entire trajectory (encourages staying close to goal)
+- smoothness_cost: Penalizes large action changes (encourages smooth trajectories)
+
+Total cost = goal_weight * goal_cost + traj_weight * trajectory_cost + smooth_weight * smoothness_cost
 """
 
 import torch
 import torch.nn as nn
 from typing import Optional, Dict, Any, Tuple
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+@dataclass
+class CostConfig:
+    """Configuration for cost function computation."""
+    # Cost weights
+    goal_weight: float = 1.0           # Weight for final state distance to goal
+    trajectory_weight: float = 0.0      # Weight for cumulative trajectory distance
+    smoothness_weight: float = 0.0      # Weight for action smoothness penalty
+    
+    # Smoothness penalty type
+    smoothness_order: int = 1           # 1 = velocity (action diff), 2 = acceleration (second diff)
+    
+    def __post_init__(self):
+        """Validate configuration."""
+        assert self.goal_weight >= 0, "goal_weight must be non-negative"
+        assert self.trajectory_weight >= 0, "trajectory_weight must be non-negative"
+        assert self.smoothness_weight >= 0, "smoothness_weight must be non-negative"
+        assert self.smoothness_order in [1, 2], "smoothness_order must be 1 or 2"
+        assert self.goal_weight + self.trajectory_weight > 0, \
+            "At least one of goal_weight or trajectory_weight must be positive"
 
 
 class LatentRollout(nn.Module):
     """
     Wrapper for latent space dynamics rollout using JEPA predictor.
-    Handles action encoding and state prediction.
+    Handles action encoding and state prediction with modular cost computation.
     """
     
     def __init__(
@@ -27,6 +56,7 @@ class LatentRollout(nn.Module):
             jepa_model: Trained JEPA model with predictor and action encoder
             action_dim: Dimensionality of action space
             channel_mask: Optional mask for cost computation (C,) - which channels to use
+                         e.g., only visual channels (first 16) or all 18 channels
             device: Device to run on
         """
         super().__init__()
@@ -78,7 +108,6 @@ class LatentRollout(nn.Module):
         self.jepa.eval()
         
         if enable_grad:
-            # Allow gradients to flow through for gradient-based planning
             z_next = self.jepa.predict_state(z, action)
         else:
             with torch.no_grad():
@@ -135,104 +164,197 @@ class LatentRollout(nn.Module):
                 
             return torch.stack(trajectory, dim=0)  # (T+1, C, H, W)
     
-    def compute_cost(
+    def _apply_channel_mask(
         self,
         z: torch.Tensor,
-        z_goal: torch.Tensor,
-        reduction: str = 'mean'
-    ) -> torch.Tensor:
-        """
-        Compute cost between states (Euclidean distance in latent space).
-        
-        Args:
-            z: Current state(s) - (C, H, W), (B, C, H, W), or (T, C, H, W)
-            z_goal: Goal state (C, H, W)
-            reduction: How to aggregate spatial dimensions ('mean', 'sum', or 'none')
-            
-        Returns:
-            cost: Scalar cost or per-batch costs
-        """
-        # Apply channel mask if specified
+        z_goal: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply channel mask to states for cost computation."""
         if self.channel_mask is not None:
-            # Ensure z_goal has batch dim for indexing
-            z_goal_expanded = z_goal.unsqueeze(0) if z_goal.dim() == 3 else z_goal
-            z_masked = z[:, self.channel_mask] if z.dim() == 4 else z[self.channel_mask]
-            z_goal_masked = z_goal_expanded[:, self.channel_mask].squeeze(0)
+            if z.dim() == 4:
+                z_masked = z[:, self.channel_mask]
+            else:
+                z_masked = z[self.channel_mask]
+            
+            if z_goal.dim() == 4:
+                z_goal_masked = z_goal[:, self.channel_mask]
+            else:
+                z_goal_masked = z_goal[self.channel_mask]
         else:
             z_masked = z
             z_goal_masked = z_goal
             
-        # Compute squared Euclidean distance
-        diff = z_masked - z_goal_masked
-        squared_dist = (diff ** 2)
+        return z_masked, z_goal_masked
+    
+    def state_distance(
+        self,
+        z: torch.Tensor,
+        z_goal: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute Euclidean distance between states (with channel masking).
         
-        # Aggregate spatial dimensions
-        if reduction == 'mean':
-            # For single state (C, H, W), return scalar
-            if z.dim() == 3:
-                cost = squared_dist.mean()
-            else:
-                # For batch (B, C, H, W), return (B,)
-                dims = tuple(range(1, squared_dist.dim()))
-                cost = squared_dist.mean(dim=dims)
-        elif reduction == 'sum':
-            if z.dim() == 3:
-                cost = squared_dist.sum()
-            else:
-                dims = tuple(range(1, squared_dist.dim()))
-                cost = squared_dist.sum(dim=dims)
-        else:  # 'none'
-            cost = squared_dist
+        Args:
+            z: State(s) - (C, H, W), (B, C, H, W), or (T, C, H, W)
+            z_goal: Goal state (C, H, W)
             
-        return cost
+        Returns:
+            distance: Scalar for single state, or (B,) / (T,) for batched
+        """
+        z_masked, z_goal_masked = self._apply_channel_mask(z, z_goal)
+        
+        squared_dist = (z_masked - z_goal_masked) ** 2
+
+        # # Isometry
+        # h_masked = self.jepa.isometry(z_masked)
+        # h_goal_masked = self.jepa.isometry(z_goal_masked)
+        # squared_dist = (h_masked - h_goal_masked) ** 2
+        
+        if z.dim() == 3:
+            # Single state -> scalar
+            dist = squared_dist.sum().sqrt()
+        else:
+            # Batched -> per-sample distance
+            dims = tuple(range(1, squared_dist.dim()))
+            dist = squared_dist.sum(dim=dims).sqrt()
+    
+        # Apply transform per provar
+        # dist = 1 - torch.exp(-5 * dist)
+
+        return dist
+
+    def goal_cost(
+        self,
+        trajectory: torch.Tensor,
+        z_goal: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute cost based on final state distance to goal.
+        
+        Args:
+            trajectory: (T+1, C, H, W) or (B, T+1, C, H, W)
+            z_goal: Goal state (C, H, W)
+            
+        Returns:
+            cost: Scalar or (B,)
+        """
+        if trajectory.dim() == 5:
+            # Batched: (B, T+1, C, H, W) -> final states (B, C, H, W)
+            final_states = trajectory[:, -1]
+        else:
+            # Single: (T+1, C, H, W) -> final state (C, H, W)
+            final_states = trajectory[-1]
+            
+        return self.state_distance(final_states, z_goal)
     
     def trajectory_cost(
         self,
         trajectory: torch.Tensor,
-        z_goal: torch.Tensor,
-        discount: float = 1.0
+        z_goal: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute total discounted cost over trajectory.
+        Compute cumulative cost along entire trajectory (no discount).
+        
+        Args:
+            trajectory: (T+1, C, H, W) or (B, T+1, C, H, W)
+            z_goal: Goal state (C, H, W)
+            
+        Returns:
+            cost: Scalar or (B,)
+        """
+        if trajectory.dim() == 5:
+            # Batched: (B, T+1, C, H, W)
+            B, T_plus_1, C, H, W = trajectory.shape
+            costs = torch.zeros(B, device=trajectory.device, dtype=trajectory.dtype)
+            
+            for t in range(T_plus_1):
+                costs = costs + self.state_distance(trajectory[:, t], z_goal)
+                
+        else:
+            # Single: (T+1, C, H, W)
+            T_plus_1 = trajectory.shape[0]
+            costs = torch.tensor(0.0, device=trajectory.device, dtype=trajectory.dtype)
+            
+            for t in range(T_plus_1):
+                costs = costs + self.state_distance(trajectory[t], z_goal)
+                
+        return costs
+    
+    def smoothness_cost(
+        self,
+        actions: torch.Tensor,
+        order: int = 1
+    ) -> torch.Tensor:
+        """
+        Compute action smoothness penalty.
+        
+        Args:
+            actions: Action sequence (T, action_dim) or (B, T, action_dim)
+            order: 1 for velocity (first diff), 2 for acceleration (second diff)
+            
+        Returns:
+            cost: Scalar or (B,)
+        """
+        if actions.dim() == 3:
+            # Batched: (B, T, action_dim)
+            if order == 1:
+                # Penalize action changes (velocity)
+                diffs = actions[:, 1:] - actions[:, :-1]
+            else:
+                # Penalize acceleration
+                diffs = actions[:, 2:] - 2 * actions[:, 1:-1] + actions[:, :-2]
+            
+            return (diffs ** 2).sum(dim=(1, 2))
+        else:
+            # Single: (T, action_dim)
+            if order == 1:
+                diffs = actions[1:] - actions[:-1]
+            else:
+                diffs = actions[2:] - 2 * actions[1:-1] + actions[:-2]
+            
+            return (diffs ** 2).sum()
+    
+    def total_cost(
+        self,
+        trajectory: torch.Tensor,
+        z_goal: torch.Tensor,
+        actions: torch.Tensor,
+        config: CostConfig
+    ) -> torch.Tensor:
+        """
+        Compute total weighted cost.
         
         Args:
             trajectory: Latent trajectory (T+1, C, H, W) or (B, T+1, C, H, W)
             z_goal: Goal state (C, H, W)
-            discount: Discount factor for future costs
+            actions: Action sequence (T, action_dim) or (B, T, action_dim)
+            config: Cost configuration with weights
             
         Returns:
-            total_cost: Scalar tensor for single trajectory, or (B,) tensor for batched
+            total_cost: Weighted sum of costs
         """
-        if trajectory.dim() == 5:
-            # Batched trajectories (B, T+1, C, H, W)
-            B, T, C, H, W = trajectory.shape
+        cost = torch.tensor(0.0, device=trajectory.device, dtype=trajectory.dtype)
+        
+        if config.goal_weight > 0:
+            cost = cost + config.goal_weight * self.goal_cost(trajectory, z_goal)
             
-            # Compute per-timestep costs
-            costs = []
-            for t in range(T):
-                cost_t = self.compute_cost(trajectory[:, t], z_goal)
-                costs.append(cost_t * (discount ** t))
-                
-            return torch.stack(costs, dim=0).sum(dim=0)  # (B,)
+        if config.trajectory_weight > 0:
+            cost = cost + config.trajectory_weight * self.trajectory_cost(trajectory, z_goal)
             
-        else:
-            # Single trajectory (T+1, C, H, W)
-            T, C, H, W = trajectory.shape
+        if config.smoothness_weight > 0:
+            cost = cost + config.smoothness_weight * self.smoothness_cost(
+                actions, order=config.smoothness_order
+            )
             
-            # Accumulate scalar costs
-            total_cost = torch.tensor(0.0, device=trajectory.device, dtype=trajectory.dtype)
-            for t in range(T):
-                cost_t = self.compute_cost(trajectory[t], z_goal)  # scalar
-                total_cost = total_cost + cost_t * (discount ** t)
-                
-            return total_cost  # scalar tensor
+        return cost
     
     def forward(
         self,
         z_init: torch.Tensor,
         actions: torch.Tensor,
         z_goal: torch.Tensor,
-        discount: float = 1.0
+        config: CostConfig,
+        enable_grad: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Complete forward pass: rollout + cost computation.
@@ -241,14 +363,15 @@ class LatentRollout(nn.Module):
             z_init: Initial state (C, H, W)
             actions: Action sequence (T, action_dim) or (B, T, action_dim)
             z_goal: Goal state (C, H, W)
-            discount: Discount factor
+            config: Cost configuration
+            enable_grad: Whether to enable gradient computation
             
         Returns:
             cost: Total trajectory cost
             trajectory: Full latent trajectory
         """
-        trajectory = self.rollout(z_init, actions)
-        cost = self.trajectory_cost(trajectory, z_goal, discount)
+        trajectory = self.rollout(z_init, actions, enable_grad=enable_grad)
+        cost = self.total_cost(trajectory, z_goal, actions, config)
         return cost, trajectory
 
 
@@ -265,7 +388,7 @@ class BasePlanner(ABC):
         action_bounds: Tuple[float, float] = (-1.0, 1.0),
         channel_mask: Optional[torch.Tensor] = None,
         device: str = 'cuda',
-        discount: float = 0.99,
+        cost_config: Optional[CostConfig] = None,
     ):
         """
         Args:
@@ -274,12 +397,12 @@ class BasePlanner(ABC):
             action_bounds: (min, max) bounds for actions
             channel_mask: Optional mask for cost computation
             device: Device to run on
-            discount: Discount factor for trajectory cost
+            cost_config: Configuration for cost function (defaults to goal_cost only)
         """
         self.action_dim = action_dim
         self.action_bounds = action_bounds
         self.device = device
-        self.discount = discount
+        self.cost_config = cost_config or CostConfig()
         
         # Create rollout module
         self.rollout = LatentRollout(
@@ -337,20 +460,35 @@ class BasePlanner(ABC):
             actions: Action sequence to evaluate (T, action_dim)
             
         Returns:
-            Dictionary with trajectory, cost, and per-step costs
+            Dictionary with trajectory, cost breakdown, and per-step distances
         """
         actions = self.clip_actions(actions)
-        cost, trajectory = self.rollout(z_init, actions, z_goal, self.discount)
         
-        # Compute per-step costs for analysis
-        per_step_costs = []
-        for t in range(len(trajectory)):
-            step_cost = self.rollout.compute_cost(trajectory[t], z_goal)
-            per_step_costs.append(step_cost.item())
+        with torch.no_grad():
+            trajectory = self.rollout.rollout(z_init, actions)
             
+            # Compute individual cost components
+            goal_cost = self.rollout.goal_cost(trajectory, z_goal).item()
+            traj_cost = self.rollout.trajectory_cost(trajectory, z_goal).item()
+            smooth_cost = self.rollout.smoothness_cost(
+                actions, order=self.cost_config.smoothness_order
+            ).item()
+            total_cost = self.rollout.total_cost(
+                trajectory, z_goal, actions, self.cost_config
+            ).item()
+            
+            # Per-step distances
+            per_step_distances = []
+            for t in range(len(trajectory)):
+                dist = self.rollout.state_distance(trajectory[t], z_goal).item()
+                per_step_distances.append(dist)
+        
         return {
             'trajectory': trajectory,
-            'cost': cost.item(),
-            'per_step_costs': per_step_costs,
-            'final_distance': per_step_costs[-1],
+            'total_cost': total_cost,
+            'goal_cost': goal_cost,
+            'trajectory_cost': traj_cost,
+            'smoothness_cost': smooth_cost,
+            'per_step_distances': per_step_distances,
+            'final_distance': per_step_distances[-1],
         }

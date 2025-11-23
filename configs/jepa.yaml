@@ -1,5 +1,5 @@
 trainer:
-  max_epochs: 200
+  max_epochs: 100
   accelerator: gpu
   devices: 1
   num_nodes: 1
@@ -10,24 +10,24 @@ trainer:
   gradient_clip_algorithm: norm
   # gradient accumulation (accumulate gradients for N steps before optimizer step)
   accumulate_grad_batches: 2
-  callbacks:
-  - class_path: lightning.pytorch.callbacks.ModelCheckpoint
-    init_args:
-      dirpath: checkpoints/jepa
-      filename: "JEPA-{epoch:03d}-{val/jepa_loss:.4f}"
-      monitor: val/jepa_loss
-      mode: min
-      save_top_k: 1                        # best checkpoint
-      save_last: true                      # plus a copy of the final epoch
-      auto_insert_metric_name: false       # keep filename clean
-      every_n_epochs: 1
-      save_on_train_epoch_end: true
-  logger:
-    class_path: lightning.pytorch.loggers.WandbLogger
-    init_args:
-      project: "JEPA"
-      name: "PointMaze/JEPA"
-      log_model: true
+  # callbacks:
+  # - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+  #   init_args:
+  #     dirpath: checkpoints/jepa
+  #     filename: "JEPA-{epoch:03d}-{val/jepa_loss:.4f}"
+  #     monitor: val/jepa_loss
+  #     mode: min
+  #     save_top_k: 1                        # best checkpoint
+  #     save_last: true                      # plus a copy of the final epoch
+  #     auto_insert_metric_name: false       # keep filename clean
+  #     every_n_epochs: 1
+  #     save_on_train_epoch_end: true
+  # logger:
+  #   class_path: lightning.pytorch.loggers.WandbLogger
+  #   init_args:
+  #     project: "JEPA"
+  #     name: "PointMaze/JEPA"
+  #     log_model: true
 
 
 model:
@@ -39,22 +39,23 @@ model:
   # cov_coeff: 15.5
   var_coeff: 15.0
   cov_coeff: 1.0
-  smooth_coeff: 0.1
-  idm_coeff: 5.2
+  smooth_coeff: 0.0
+  # idm_coeff: 5.2
+  idm_coeff: 1.0
   tvcreg_coeff: 1.0
   prediction_cost_discount: 0.95
-  isometry_coeff: 1e-1
+  isometry_coeff: .1
 
   # Optimization hyperparameters
   initial_lr_encoder: 2e-3
   final_lr_encoder: 1e-6
-  weight_decay_encoder: 1e-4
+  weight_decay_encoder: 1e-5
   initial_lr_decoder: 1e-3
   final_lr_decoder: 1e-5
   weight_decay_decoder: 0.0
   initial_lr_predictor: 1e-3
   final_lr_predictor: 1e-6
-  weight_decay_predictor: 0.0
+  weight_decay_predictor: 1e-5
   warmup_steps: 1000
 
   # Misc
