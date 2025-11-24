@@ -48,6 +48,7 @@ class JEPA(L.LightningModule):
         # ============================================================================
         value_gamma: float = 0.99,
         value_tau: float = 0.005,
+        value_expectile: float = 0.7,
         value_hindsight_ratio: float = 0.8,
         value_update_freq: int = 2,
         
@@ -94,7 +95,6 @@ class JEPA(L.LightningModule):
         
         self.tvcreg_proj_1 = nn.Sequential(
             nn.Conv2d(18, 36, kernel_size=3, padding=1),
-            nn.GELU(),
         )
         self.tvcreg_proj_2 = nn.Sequential(
             nn.Linear(26*26, 26*26*2),
@@ -112,6 +112,7 @@ class JEPA(L.LightningModule):
             emb_dim=emb_dim,
             gamma=value_gamma,
             tau=value_tau,
+            expectile=value_expectile,
             hindsight_ratio=value_hindsight_ratio,
         )
         

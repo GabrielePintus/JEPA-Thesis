@@ -20,50 +20,51 @@ from typing import Dict, Optional, Tuple
 
 class IsometricValueNetwork(nn.Module):
     """
-    Simple isometric value network.
+    Fully spatial isometric value network.
     
     Architecture:
-        z (18, 26, 26) → CNN → flatten → MLP → h (emb_dim)
-        V(z, g) = -||h_z - h_g||₂
+        z (18, 26, 26) → CNN → h (emb_dim, H, W)
+        V(z, g) = -||h_z - h_g||₂  (distance over ALL spatial features)
+    
+    Computes distance directly in spatial feature space - no pooling!
     """
     
     def __init__(
         self,
         state_channels: int = 18,
-        emb_dim: int = 128,
+        emb_dim: int = 128
     ):
         super().__init__()
         self.emb_dim = emb_dim
         
-        # Simple encoder to isometric space
+        # Spatial encoder - preserves ALL spatial information
         self.encoder = nn.Sequential(
-            nn.Conv2d(state_channels, 32, 5, 2, 2),  # 18x26x26 → 32x13x13
+            nn.Conv2d(state_channels, 32, kernel_size=3, stride=1, padding=1),  # 18x26x26 → 32x26x26
             nn.GroupNorm(8, 32),
             nn.GELU(),
-            nn.Conv2d(32, 64, 3, 2, 1),               # 32x13x13 → 64x7x7
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.Conv2d(64, 16, kernel_size=3, stride=1, padding=1), # 64x7x7 → 16x7x7
-            nn.Flatten(),               
-            nn.LayerNorm(16 * 7 * 7), # 784
-            nn.Linear(16 * 7 * 7, emb_dim), # 784 → emb_dim
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=0),               # 32x26x26 → 64x24x24
         )
     
     def encode(self, z: torch.Tensor) -> torch.Tensor:
         """
-        Encode state to isometric embedding (normalized).
+        Encode state to spatial features (NO pooling!).
         
         Args:
             z: (B, 18, 26, 26)
         Returns:
-            h: (B, emb_dim) normalized to unit sphere
+            h: (B, emb_dim, 7, 7) - full spatial features
         """
-        h = self.encoder(z)
-        return F.normalize(h, p=2, dim=-1)
+        # Spatial features
+        h_spatial = self.encoder(z)  # (B, emb_dim, 7, 7)
+        
+        # Normalize per-channel (preserve spatial structure)
+        h_spatial = F.normalize(h_spatial, p=2, dim=1)  # Normalize channels
+        
+        return h_spatial  # (B, emb_dim, 7, 7)
     
     def compute_value(self, z_state: torch.Tensor, z_goal: torch.Tensor) -> torch.Tensor:
         """
-        V(z, g) = -||h_z - h_g||
+        V(z, g) = -||h_z - h_g||  over FULL spatial feature maps
         
         Args:
             z_state: (B, 18, 26, 26)
@@ -71,10 +72,13 @@ class IsometricValueNetwork(nn.Module):
         Returns:
             value: (B,)
         """
-        h_state = self.encode(z_state)
-        h_goal = self.encode(z_goal)
+        h_state = self.encode(z_state)  # (B, emb_dim, 7, 7)
+        h_goal = self.encode(z_goal)    # (B, emb_dim, 7, 7)
         
-        distance = torch.norm(h_state - h_goal, p=2, dim=-1)
+        # Distance over ALL spatial features
+        diff = h_state - h_goal  # (B, emb_dim, 7, 7)
+        distance = torch.sqrt((diff ** 2).sum(dim=[1, 2, 3]))  # (B,)
+        
         return -distance
 
 
@@ -91,12 +95,14 @@ class IsometricQLearning(nn.Module):
         emb_dim: int = 128,
         gamma: float = 0.99,
         tau: float = 0.005,
+        expectile: float = 0.7,
         hindsight_ratio: float = 0.8,
     ):
         super().__init__()
         
         self.gamma = gamma
         self.tau = tau
+        self.expectile = expectile
         self.hindsight_ratio = hindsight_ratio
         
         # Value network
@@ -119,10 +125,9 @@ class IsometricQLearning(nn.Module):
             B, T, C, H, W = z_state.shape
             z_state_flat = z_state.flatten(0, 1)
             z_goal_expanded = z_goal.unsqueeze(1).expand(-1, T, -1, -1, -1).flatten(0, 1)
+            
             diff = z_state_flat - z_goal_expanded
-            squared_diff = diff.pow(2)
-            sqaured_diff_sum = squared_diff.sum(dim=[1, 2, 3]).view(-1, 1)
-            distance = sqaured_diff_sum.sqrt()
+            distance = torch.sqrt((diff ** 2).sum(dim=[1, 2, 3]))
             reward = (distance < threshold).float() * 1.0 - (distance >= threshold).float() * 0.1
             
             return reward.view(B, T)
@@ -156,6 +161,21 @@ class IsometricQLearning(nn.Module):
         z_goals_relabeled[relabel_indices] = new_goals
         
         return z_goals_relabeled
+    
+    def expectile_loss(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute expectile regression loss used in IQL.
+        
+        Args:
+            prediction: predicted values.
+            target: target values (treated as constants).
+        
+        Returns:
+            Scalar expectile loss encouraging overestimation when expectile>0.5.
+        """
+        diff = target - prediction
+        weight = torch.where(diff > 0, self.expectile, 1 - self.expectile)
+        return (weight * diff.pow(2)).mean()
     
     def compute_q_loss(
         self,
@@ -199,8 +219,8 @@ class IsometricQLearning(nn.Module):
             v_target_next = self.value_target.compute_value(z_next, z_goals_expanded)
             v_target = rewards_flat + self.gamma * v_target_next
         
-        # Value loss (implicit Q-learning style)
-        value_loss = F.mse_loss(v_next, v_target)
+        # Value loss (Implicit Q-Learning with expectile regression)
+        value_loss = self.expectile_loss(v_next, v_target)
         
         # Metrics
         with torch.no_grad():

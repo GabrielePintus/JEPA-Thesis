@@ -13,7 +13,6 @@ class MeNet6(nn.Module):
     def __init__(self, input_channels=3):
         super().__init__()
         self.activation = nn.ReLU()
-        # self.activation = nn.GELU()
 
         self.net = nn.Sequential(
             nn.Conv2d(input_channels, 16, kernel_size=5, stride=1), # (16, 60, 60)

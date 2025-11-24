@@ -42,7 +42,7 @@ model:
   idm_coeff: 1.0
   tvcreg_coeff: 1.0
   prediction_cost_discount: 0.95
-  isometry_coeff: 0.0
+  isometry_coeff: 1e-3
 
   # ============================================================================
   # Value Function (NEW - Only 5 parameters!)
@@ -50,6 +50,7 @@ model:
   value_coeff: 1.0                   # Weight of value loss (start with 1.0)
   value_gamma: 0.99                  # Discount factor
   value_tau: 0.005                   # Target network update rate
+  value_expectile: 0.7               # Expectile regression (70%)
   value_hindsight_ratio: 0.8         # Hindsight relabeling (80%)
   value_update_freq: 2               # Update target every 2 steps
 

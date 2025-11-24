@@ -7,7 +7,6 @@ class ConvPredictor(nn.Module):
     def __init__(self, in_channels=20, hidden_channels=32, out_channels=18):
         super().__init__()
         self.activation = nn.ReLU()
-        # self.activation = nn.GELU()
 
         self.layers = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
