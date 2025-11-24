@@ -40,9 +40,9 @@ model:
   cov_coeff: 1.0
   smooth_coeff: 0.0
   idm_coeff: 1.0
-  tvcreg_coeff: 1.0
+  tvcreg_coeff: 1e-2
   prediction_cost_discount: 0.95
-  isometry_coeff: 1e-3
+  isometry_coeff: 1.0
 
   # ============================================================================
   # Value Function (NEW - Only 5 parameters!)
@@ -57,16 +57,16 @@ model:
   # ============================================================================
   # JEPA Optimization (unchanged from your config)
   # ============================================================================
-  initial_lr_encoder: 2e-3
+  initial_lr_encoder: 5e-3
   final_lr_encoder: 1e-6
   weight_decay_encoder: 1e-5
   initial_lr_decoder: 1e-3
   final_lr_decoder: 1e-5
   weight_decay_decoder: 0.0
-  initial_lr_predictor: 1e-3
+  initial_lr_predictor: 5e-3
   final_lr_predictor: 1e-6
   weight_decay_predictor: 1e-5
-  warmup_steps: 1000
+  warmup_steps: 500
 
   # ============================================================================
   # Value Function Optimization (NEW)
@@ -78,7 +78,7 @@ model:
   # ============================================================================
   # Misc
   # ============================================================================
-  compile: false
+  compile: true
 
 # ============================================================================
 # Data (unchanged)

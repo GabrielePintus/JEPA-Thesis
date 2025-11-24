@@ -9,7 +9,7 @@ from src.components.decoder import IDMDecoder, MeNet6Decoder, IDMDecoderConv
 from src.losses import TemporalVCRegLossOptimized as TemporalVCRegLoss
 from src.components.encoder import MeNet6, Expander2D
 from src.components.predictor import ConvPredictor
-from src.components.rl import IsometricQLearning
+from src.components.rl import ImplicitQLearning
 
 
 class JEPA(L.LightningModule):
@@ -107,13 +107,14 @@ class JEPA(L.LightningModule):
         # ========================================================================
         # Isometric Value Function (NEW - but simple!)
         # ========================================================================
-        self.value_fn = IsometricQLearning(
+        self.value_fn = ImplicitQLearning(
             state_channels=18,
-            emb_dim=emb_dim,
-            gamma=value_gamma,
-            tau=value_tau,
-            expectile=value_expectile,
-            hindsight_ratio=value_hindsight_ratio,
+            action_dim=2,  # Add action dimension
+            emb_dim=64,
+            gamma=self.hparams.value_gamma,
+            tau=self.hparams.value_tau,
+            expectile=self.hparams.value_expectile,
+            hindsight_ratio=self.hparams.value_hindsight_ratio,
         )
         
         # Training step counter for target updates
@@ -273,22 +274,25 @@ class JEPA(L.LightningModule):
         # Sample goals
         z_goals = self.sample_goals(z.detach(), strategy='future')
         
-        # Get predicted next states for value learning
-        z_next_pred_seq = []
-        z_curr = z[:, 0].detach()
-        for t in range(T):
-            z_next = self.predict_state(z_curr, actions[:, t])
-            z_next_pred_seq.append(z_next)
-            z_curr = z_next
-        z_next_pred = torch.stack(z_next_pred_seq, dim=1)  # (B, T, 18, 26, 26)
+        # # Get predicted next states for value learning
+        # z_next_pred_seq = []
+        # z_curr = z[:, 0].detach()
+        # for t in range(T):
+        #     z_next = self.predict_state(z_curr, actions[:, t])
+        #     z_next_pred_seq.append(z_next)
+        #     z_curr = z_next
+        # z_next_pred = torch.stack(z_next_pred_seq, dim=1)  # (B, T, 18, 26, 26)
         
-        # Compute value loss
-        value_metrics = self.value_fn.compute_q_loss(
-            z_states=z[:, :-1].detach(),  # Current states
-            z_next_states=z_next_pred.detach(),  # Predicted next states
+        # Compute RL loss
+        rl_losses = self.value_fn.compute_losses(
+            z_states=z[:, :-1].detach(),
+            actions=actions,  # Now you need actions
+            z_next_states=z[:, 1:].detach(),
             z_goals=z_goals,
         )
-        value_loss = value_metrics['loss']
+        value_loss = rl_losses['value_loss']
+        q_loss = rl_losses['q_loss']
+        total_rl_loss = value_loss + q_loss
 
         # ========================================================================
         # Total Loss
@@ -301,7 +305,7 @@ class JEPA(L.LightningModule):
             idm_loss * self.hparams.idm_coeff
         )
         
-        total_loss = recon_loss + jepa_loss + value_loss * self.hparams.value_coeff
+        total_loss = recon_loss + jepa_loss + total_rl_loss * self.hparams.value_coeff
 
         # ========================================================================
         # Metrics
@@ -317,12 +321,9 @@ class JEPA(L.LightningModule):
             'loss_tvcreg_var': loss_tvcreg['var-loss'],
             'loss_tvcreg_cov': loss_tvcreg['cov-loss'],
             "idm_loss": idm_loss,
-            "value_loss": value_metrics['value_loss'],
-            "value_error": value_metrics['value_error'],
-            "value_mean": value_metrics['value_mean'],
-            "value_std": value_metrics['value_std'],
-            "reward_mean": value_metrics['reward_mean'],
+            "rl_loss": total_rl_loss,
         }
+        metrics.update(rl_losses)
         
         if stage == 'train':
             metrics.update({
