@@ -41,9 +41,6 @@ class MPPIPlanner(BasePlanner):
         temperature: float = 1.0,
         noise_sigma: float = 0.5,
         noise_decay: float = 0.95,
-        # Elite retention
-        num_elites: int = 10,
-        elite_weight: float = 0.3,
         adaptive_temp: bool = True,
     ):
         """
@@ -59,8 +56,6 @@ class MPPIPlanner(BasePlanner):
             temperature: Temperature for exponential weighting (lower = more greedy)
             noise_sigma: Standard deviation for sampling noise
             noise_decay: Decay rate for noise per iteration
-            num_elites: Number of elite samples to retain
-            elite_weight: Weight for blending with best elite
             adaptive_temp: Adapt temperature based on cost variance
         """
         super().__init__(
@@ -77,8 +72,6 @@ class MPPIPlanner(BasePlanner):
         self.temperature = temperature
         self.noise_sigma = noise_sigma
         self.noise_decay = noise_decay
-        self.num_elites = num_elites
-        self.elite_weight = elite_weight
         self.adaptive_temp = adaptive_temp
         
     def _initialize_actions(
@@ -106,7 +99,6 @@ class MPPIPlanner(BasePlanner):
         self,
         nominal_actions: torch.Tensor,
         noise_sigma: float,
-        elite_actions: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Sample perturbed action sequences around nominal trajectory.
@@ -114,29 +106,17 @@ class MPPIPlanner(BasePlanner):
         Args:
             nominal_actions: Nominal action sequence (horizon, action_dim)
             noise_sigma: Noise standard deviation
-            elite_actions: Elite samples from previous iteration
             
         Returns:
             samples: Sampled action sequences (num_samples, horizon, action_dim)
         """
         horizon, action_dim = nominal_actions.shape
         
-        if elite_actions is not None:
-            num_random = self.num_samples - len(elite_actions)
-        else:
-            num_random = self.num_samples
-            
         # Sample random trajectories
-        noise = torch.randn(num_random, horizon, action_dim, device=self.device) * noise_sigma
-        random_samples = nominal_actions.unsqueeze(0) + noise
-        random_samples = self.clip_actions(random_samples)
+        noise = torch.randn(self.num_samples, horizon, action_dim, device=self.device) * noise_sigma
+        samples = nominal_actions.unsqueeze(0) + noise
+        samples = self.clip_actions(samples)
         
-        # Combine with elites
-        if elite_actions is not None and len(elite_actions) > 0:
-            samples = torch.cat([random_samples, elite_actions], dim=0)
-        else:
-            samples = random_samples
-            
         return samples
     
     def _compute_weights(
@@ -190,7 +170,6 @@ class MPPIPlanner(BasePlanner):
         
         # Initialize
         nominal_actions = self._initialize_actions(horizon, initial_actions)
-        elite_actions = None
         
         # Tracking
         cost_history = []
@@ -204,9 +183,9 @@ class MPPIPlanner(BasePlanner):
         pbar = tqdm(range(self.num_iterations), disable=not verbose, desc="MPPI")
         
         for iteration in pbar:
-            # Sample trajectories (including elites)
+            # Sample trajectories
             sampled_actions = self._sample_trajectories(
-                nominal_actions, current_noise_sigma, elite_actions
+                nominal_actions, current_noise_sigma
             )
             
             # Evaluate samples
@@ -224,26 +203,14 @@ class MPPIPlanner(BasePlanner):
             # Compute importance weights
             weights = self._compute_weights(costs, current_temp)
             
-            # Select elites for next iteration
-            elite_indices = torch.argsort(costs)[:self.num_elites]
-            elite_actions = sampled_actions[elite_indices].clone()
-            
-            # Update best
-            if costs[elite_indices[0]] < best_cost:
-                best_cost = costs[elite_indices[0]].item()
-                best_actions = sampled_actions[elite_indices[0]].clone()
+            # Track best sample
+            best_idx = torch.argmin(costs)
+            if costs[best_idx] < best_cost:
+                best_cost = costs[best_idx].item()
+                best_actions = sampled_actions[best_idx].clone()
             
             # Update nominal as weighted average
             nominal_actions = (weights.view(-1, 1, 1) * sampled_actions).sum(dim=0)
-            
-            # Blend with best elite
-            if self.elite_weight > 0:
-                best_elite = sampled_actions[elite_indices[0]]
-                nominal_actions = (
-                    (1 - self.elite_weight) * nominal_actions +
-                    self.elite_weight * best_elite
-                )
-            
             nominal_actions = self.clip_actions(nominal_actions)
             
             # Decay noise

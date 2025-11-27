@@ -7,7 +7,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from src.components.decoder import IDMDecoder, MeNet6Decoder, IDMDecoderConv
 from src.losses import TemporalVCRegLossOptimized as TemporalVCRegLoss
-from src.components.encoder import MeNet6, Expander2D
+from src.components.encoder import MeNet6, Expander2D, SmoothMeNet6
 from src.components.predictor import ConvPredictor
 from src.components.rl import IsometricQLearning
 
@@ -80,7 +80,8 @@ class JEPA(L.LightningModule):
         # ========================================================================
         # JEPA Components (unchanged)
         # ========================================================================
-        self.visual_encoder = MeNet6(input_channels=3)
+        # self.visual_encoder = MeNet6(input_channels=3)
+        self.visual_encoder = SmoothMeNet6(input_channels=3)
         self.proprio_encoder = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=True)
         self.action_encoder = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=True)
         
@@ -93,31 +94,14 @@ class JEPA(L.LightningModule):
             out_channels=18,
         )
         
-        self.tvcreg_proj_1 = nn.Sequential(
+        self.tvcreg_proj = nn.Sequential(
             nn.Conv2d(18, 36, kernel_size=3, padding=1),
-        )
-        self.tvcreg_proj_2 = nn.Sequential(
-            nn.Linear(26*26, 26*26*2),
         )
         self.tvcreg_loss = TemporalVCRegLoss(
             var_coeff=self.hparams.var_coeff,
             cov_coeff=self.hparams.cov_coeff,
         )
-        
-        # ========================================================================
-        # Isometric Value Function (NEW - but simple!)
-        # ========================================================================
-        self.value_fn = IsometricQLearning(
-            state_channels=18,
-            emb_dim=emb_dim,
-            gamma=value_gamma,
-            tau=value_tau,
-            expectile=value_expectile,
-            hindsight_ratio=value_hindsight_ratio,
-        )
-        
-        # Training step counter for target updates
-        self.register_buffer('training_step_count', torch.tensor(0))
+        self.cosine_loss = lambda x , y: 1 - F.cosine_similarity(x, y, dim=-1).mean()
 
         # Optional compilation
         if compile:
@@ -125,8 +109,7 @@ class JEPA(L.LightningModule):
             self.visual_decoder = torch.compile(self.visual_decoder)
             self.predictor = torch.compile(self.predictor)
             self.idm_decoder = torch.compile(self.idm_decoder)
-            self.tvcreg_proj_1 = torch.compile(self.tvcreg_proj_1)
-            self.tvcreg_proj_2 = torch.compile(self.tvcreg_proj_2)
+            self.tvcreg_proj = torch.compile(self.tvcreg_proj)
 
     # ============================================================================
     # ENCODING (unchanged)
@@ -250,11 +233,10 @@ class JEPA(L.LightningModule):
         isometry_loss = (1 - cosine_similarity).mean()
 
         # Temporal VCReg
-        z_proj = self.tvcreg_proj_1(z.flatten(0, 1))
+        z_proj = self.tvcreg_proj(z.flatten(0, 1))
         z_proj = z_proj.view(B, T+1, 36, 26, 26).permute(0, 2, 1, 3, 4)
         z_proj = z_proj.flatten(0, 1)
         z_proj = z_proj.view(B * 36, T+1, 26*26)
-        z_proj = self.tvcreg_proj_2(z_proj)
         loss_tvcreg = self.tvcreg_loss(z_proj)
 
         # Inverse dynamics
@@ -266,29 +248,8 @@ class JEPA(L.LightningModule):
         actions_expanded = self.action_encoder(actions_expanded)
         idm_loss = F.mse_loss(idm_pred, actions_expanded)
 
-        # ========================================================================
-        # Value Function Learning (NEW!)
-        # ========================================================================
-        
-        # Sample goals
-        z_goals = self.sample_goals(z.detach(), strategy='future')
-        
-        # Get predicted next states for value learning
-        z_next_pred_seq = []
-        z_curr = z[:, 0].detach()
-        for t in range(T):
-            z_next = self.predict_state(z_curr, actions[:, t])
-            z_next_pred_seq.append(z_next)
-            z_curr = z_next
-        z_next_pred = torch.stack(z_next_pred_seq, dim=1)  # (B, T, 18, 26, 26)
-        
-        # Compute value loss
-        value_metrics = self.value_fn.compute_q_loss(
-            z_states=z[:, :-1].detach(),  # Current states
-            z_next_states=z_next_pred.detach(),  # Predicted next states
-            z_goals=z_goals,
-        )
-        value_loss = value_metrics['loss']
+        # Smooth loss
+        smooth_loss = self.cosine_loss(z[:, 1:], z[:, :-1])
 
         # ========================================================================
         # Total Loss
@@ -301,7 +262,7 @@ class JEPA(L.LightningModule):
             idm_loss * self.hparams.idm_coeff
         )
         
-        total_loss = recon_loss + jepa_loss + value_loss * self.hparams.value_coeff
+        total_loss = recon_loss + jepa_loss
 
         # ========================================================================
         # Metrics
@@ -317,11 +278,6 @@ class JEPA(L.LightningModule):
             'loss_tvcreg_var': loss_tvcreg['var-loss'],
             'loss_tvcreg_cov': loss_tvcreg['cov-loss'],
             "idm_loss": idm_loss,
-            "value_loss": value_metrics['value_loss'],
-            "value_error": value_metrics['value_error'],
-            "value_mean": value_metrics['value_mean'],
-            "value_std": value_metrics['value_std'],
-            "reward_mean": value_metrics['reward_mean'],
         }
         
         if stage == 'train':
@@ -329,20 +285,13 @@ class JEPA(L.LightningModule):
                 "lr_encoder": self.trainer.optimizers[0].param_groups[0]['lr'],
                 "lr_decoder": self.trainer.optimizers[0].param_groups[1]['lr'],
                 "lr_predictor": self.trainer.optimizers[0].param_groups[2]['lr'],
-                "lr_value": self.trainer.optimizers[0].param_groups[3]['lr'],
             })
 
         return metrics
 
     def training_step(self, batch, batch_idx):
         outs = self.shared_step(batch, batch_idx, stage='train')
-        self.log_dict({f"train/{k}": v for k, v in outs.items()}, prog_bar=True, sync_dist=True)
-        
-        # Update value target network
-        self.training_step_count += 1
-        if self.training_step_count % self.hparams.value_update_freq == 0:
-            self.value_fn.update_target()
-        
+        self.log_dict({f"train/{k}": v for k, v in outs.items()}, prog_bar=True, sync_dist=True)        
         return outs["loss"]
 
     def validation_step(self, batch, batch_idx):
@@ -361,8 +310,7 @@ class JEPA(L.LightningModule):
                     "params": list(self.visual_encoder.parameters()) +
                               list(self.proprio_encoder.parameters()) +
                               list(self.action_encoder.parameters()) +
-                              list(self.tvcreg_proj_1.parameters()) +
-                              list(self.tvcreg_proj_2.parameters()) +
+                              list(self.tvcreg_proj.parameters()) +
                               list(self.idm_decoder.parameters()),
                     "lr": self.hparams.initial_lr_encoder,
                     "weight_decay": self.hparams.weight_decay_encoder,
@@ -376,11 +324,6 @@ class JEPA(L.LightningModule):
                     "params": list(self.predictor.parameters()),
                     "lr": self.hparams.initial_lr_predictor,
                     "weight_decay": self.hparams.weight_decay_predictor,
-                },
-                {
-                    "params": list(self.value_fn.value_net.parameters()),
-                    "lr": self.hparams.initial_lr_value,
-                    "weight_decay": self.hparams.weight_decay_value,
                 },
             ]
         )
@@ -417,7 +360,6 @@ class JEPA(L.LightningModule):
             make_lr_lambda(self.hparams.initial_lr_encoder, self.hparams.final_lr_encoder),
             make_lr_lambda(self.hparams.initial_lr_decoder, self.hparams.final_lr_decoder),
             make_lr_lambda(self.hparams.initial_lr_predictor, self.hparams.final_lr_predictor),
-            make_lr_lambda(self.hparams.initial_lr_value, self.hparams.final_lr_value),
         ]
 
         scheduler = LambdaLR(optimizer, lr_lambda=lr_lambdas)

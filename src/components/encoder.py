@@ -34,52 +34,35 @@ class MeNet6(nn.Module):
         return self.net(x)
 
 
-class CNNEncoder(nn.Module):
-    def __init__(self, input_channels=3, base_channels=32):
+class SmoothMeNet6(nn.Module):
+    def __init__(self, input_channels=3):
         super().__init__()
-        self.activation = nn.GELU()  # Better than ReLU for smooth gradients
-        
-        # Stem: preserve more spatial information early
-        self.stem = nn.Sequential(
-            nn.Conv2d(input_channels, base_channels, kernel_size=3, stride=1, padding=1),
-            nn.GroupNorm(8, base_channels),
+        self.activation = nn.ReLU()
+
+        self.net = nn.Sequential(
+            nn.Conv2d(input_channels, 16, kernel_size=5, stride=1, padding=0),
+            nn.GroupNorm(4, 16),
             self.activation,
-        )
-        
-        # Residual blocks with gradual downsampling
-        self.block1 = self._make_residual_block(base_channels, base_channels*2, stride=2)
-        # (B, 64, 32, 32)
-        
-        self.block2 = self._make_residual_block(base_channels*2, base_channels*3, stride=2)
-        # (B, 128, 16, 16)
-        
-        self.block3 = self._make_residual_block(base_channels*3, base_channels*3, stride=2)
-        # (B, 128, 8, 8)
-        
-        # Don't pool too aggressively - keep 8×8 spatial structure
-        
-    def _make_residual_block(self, in_channels, out_channels, stride):
-        """Residual block for better gradient flow"""
-        return nn.Sequential(
-            # Main path
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, 
-                     stride=stride, padding=1),
-            nn.GroupNorm(min(32, out_channels//4), out_channels),
+
+            nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=0),
+            nn.GroupNorm(8, 32),
             self.activation,
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, 
-                     stride=1, padding=1),
-            nn.GroupNorm(min(32, out_channels//4), out_channels),
+            nn.AvgPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=0),
+            nn.GroupNorm(8, 32),
+            self.activation,
+
+            nn.Conv2d(32, 16, kernel_size=3, stride=1, padding=1),
         )
-    
+
     def forward(self, x):
-        x = self.stem(x)
-        
-        # Residual connections
-        x1 = self.block1(x)
-        x2 = self.block2(x1) 
-        x3 = self.block3(x2)
-        
-        return x3  # (B, 128, 8, 8)
+        return self.net(x)
+
+
+
+
+
 
 class MLPHead(nn.Module):
     def __init__(self, spatial_features=96*8*8, emb_dim=256):
