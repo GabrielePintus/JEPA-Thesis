@@ -240,21 +240,21 @@ class JEPA(L.LightningModule):
             z_current = z_next_pred  # Use predicted state for next step
 
         # Isometry
-        h = self.encode_isometry(z)
-        h_pairs = self.unique_state_pairs(h)
-        h_i = h_pairs[:, :, 0, :]
-        h_j = h_pairs[:, :, 1, :]
-        pred_distances = self.distance(h_i, h_j)
+        # h = self.encode_isometry(z)
+        # h_pairs = self.unique_state_pairs(h)
+        # h_i = h_pairs[:, :, 0, :]
+        # h_j = h_pairs[:, :, 1, :]
+        # pred_distances = self.distance(h_i, h_j)
         
-        time_indices = torch.arange(T+1, device=h_pairs.device, dtype=h_pairs.dtype)
-        time_pairs = self.unique_state_pairs(time_indices.unsqueeze(0).unsqueeze(-1))
-        t_i = time_pairs[:, :, 0, 0]
-        t_j = time_pairs[:, :, 1, 0]
-        target_distances = (t_i - t_j).abs()
+        # time_indices = torch.arange(T+1, device=h_pairs.device, dtype=h_pairs.dtype)
+        # time_pairs = self.unique_state_pairs(time_indices.unsqueeze(0).unsqueeze(-1))
+        # t_i = time_pairs[:, :, 0, 0]
+        # t_j = time_pairs[:, :, 1, 0]
+        # target_distances = (t_i - t_j).abs()
         
-        cosine_similarity = F.cosine_similarity(pred_distances, target_distances / 500.0, dim=-1)
-        isometry_loss = (1 - cosine_similarity).mean()
-        # isometry_loss = torch.tensor(0.0, device=z.device)
+        # cosine_similarity = F.cosine_similarity(pred_distances, target_distances / 500.0, dim=-1)
+        # isometry_loss = (1 - cosine_similarity).mean()
+        isometry_loss = torch.tensor(0.0, device=z.device)
 
         # Temporal VCReg
         z_proj = z.flatten(0, 1)

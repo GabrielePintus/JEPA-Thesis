@@ -1,5 +1,5 @@
 trainer:
-  max_epochs: 5
+  max_epochs: 20
   accelerator: gpu
   devices: 1
   num_nodes: 1
@@ -42,24 +42,24 @@ model:
   var_coeff:      0.0
   smooth_coeff:   0.0
   isometry_coeff: 0.0
-  idm_coeff:      1.0
+  idm_coeff:      2.0
   entropy_coeff:  0.0
 
   # Optimization hyperparameters
   # initial_lr_encoder:     1e-2
-  initial_lr_encoder:     1e-2
+  initial_lr_encoder:     5e-3
   final_lr_encoder:       1e-7
   weight_decay_encoder:   1e-4
 
-  initial_lr_decoder:     5e-2
+  initial_lr_decoder:     1e-2
   final_lr_decoder:       1e-5
   weight_decay_decoder:   0
 
-  initial_lr_predictor:   5e-2
+  initial_lr_predictor:   1e-2
   final_lr_predictor:     1e-7
   weight_decay_predictor: 1e-4
 
-  warmup_steps: 200
+  warmup_steps: 100
 
   # Misc
   compile: true
@@ -67,7 +67,7 @@ model:
 
 data:
   data_path: data/train_trajectories_200_100_4_64_largerdot_singlelayout.npz
-  batch_size: 64
+  batch_size: 96
   num_workers: 2
   pin_memory: true
   val_size: 0.1
