@@ -8,7 +8,7 @@ class ConvPredictor(nn.Module):
         super().__init__()
         self.activation = nn.ReLU()
 
-        self.layers = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
             nn.GroupNorm(4, hidden_channels),
             self.activation,
@@ -17,13 +17,10 @@ class ConvPredictor(nn.Module):
             nn.GroupNorm(4, hidden_channels),
             self.activation,
 
-            # nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
-            # nn.GroupNorm(4, hidden_channels),
-            # self.activation,
-
             nn.Conv2d(hidden_channels, out_channels, kernel_size=3, stride=1, padding=1)
         )
 
     def forward(self, x):
-        return self.layers(x)
+        return self.net(x)
+
 

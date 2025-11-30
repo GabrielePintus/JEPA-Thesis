@@ -6,10 +6,10 @@ trainer:
   strategy: ddp_find_unused_parameters_false
   precision: bf16-mixed
   # gradient clipping
-  # gradient_clip_val: 1.0
+  gradient_clip_val: 1.0
   # gradient_clip_algorithm: norm
   # gradient accumulation (accumulate gradients for N steps before optimizer step)
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 2
   callbacks:
   - class_path: lightning.pytorch.callbacks.ModelCheckpoint
     init_args:
@@ -17,7 +17,7 @@ trainer:
       filename: "JEPA-{epoch:03d}-{val/jepa_loss:.4f}"
       monitor: val/jepa_loss
       mode: min
-      save_top_k: 1                        # best checkpoint
+      save_top_k: 1                          # best checkpoint
       save_last: true                      # plus a copy of the final epoch
       auto_insert_metric_name: false       # keep filename clean
       every_n_epochs: 1
@@ -33,46 +33,44 @@ trainer:
 model:
   # Architecture hyperparameters
   emb_dim: 128
+  prediction_cost_discount: 0.5
 
   # Loss coefficients
-  # var_coeff: 15.0
-  # cov_coeff: 1.0
-  # smooth_coeff: 0.1
-  # idm_coeff: 5.0
-  # tvcreg_coeff: 10.0
-  # prediction_cost_discount: 0.95
-  # isometry_coeff: 0.1
-
-  var_coeff:    54.5
-  cov_coeff:    15.5
-  smooth_coeff: 0.1
-  idm_coeff:    5.2
+  # var_coeff:    54.5
+  # cov_coeff:    15.5
+  cov_coeff:      0.0
+  var_coeff:      0.0
+  smooth_coeff:   0.0
+  isometry_coeff: 0.0
+  idm_coeff:      1.0
+  entropy_coeff:  0.0
 
   # Optimization hyperparameters
-  initial_lr_encoder:     5e-2
+  # initial_lr_encoder:     1e-2
+  initial_lr_encoder:     1e-2
   final_lr_encoder:       1e-7
-  weight_decay_encoder:   0
+  weight_decay_encoder:   1e-4
 
-  initial_lr_decoder:     1e-3
+  initial_lr_decoder:     5e-2
   final_lr_decoder:       1e-5
   weight_decay_decoder:   0
 
   initial_lr_predictor:   5e-2
   final_lr_predictor:     1e-7
-  weight_decay_predictor: 0
+  weight_decay_predictor: 1e-4
 
-  warmup_steps: 100
+  warmup_steps: 200
 
   # Misc
-  compile: false
+  compile: true
 
 
 data:
-  data_path: data/train_trajectories_1000_100_4_64_largerdot.npz
-  batch_size: 128
+  data_path: data/train_trajectories_200_100_4_64_largerdot_singlelayout.npz
+  batch_size: 64
   num_workers: 2
   pin_memory: true
   val_size: 0.1
-  seq_len: 10
-  stride: 2
+  seq_len: 16
+  stride: 1
   normalize: false

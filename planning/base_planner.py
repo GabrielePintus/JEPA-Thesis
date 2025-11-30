@@ -283,7 +283,8 @@ class LatentRollout(nn.Module):
     def smoothness_cost(
         self,
         actions: torch.Tensor,
-        order: int = 1
+        order: int = 1,
+        min_action_value: float = 1e-2,
     ) -> torch.Tensor:
         """
         Compute action smoothness penalty.
@@ -295,6 +296,9 @@ class LatentRollout(nn.Module):
         Returns:
             cost: Scalar or (B,)
         """
+        # Actions should be at least min_action_value on average to avoid zero division
+        action_magnitude_penalty = (min_action_value - actions.abs()).clamp(min=0).mean()
+
         if actions.dim() == 3:
             # Batched: (B, T, action_dim)
             if order == 1:
@@ -304,7 +308,7 @@ class LatentRollout(nn.Module):
                 # Penalize acceleration
                 diffs = actions[:, 2:] - 2 * actions[:, 1:-1] + actions[:, :-2]
             
-            return (diffs ** 2).sum(dim=(1, 2))
+            smooth_loss = (diffs ** 2).sum(dim=(1, 2))
         else:
             # Single: (T, action_dim)
             if order == 1:
@@ -312,7 +316,9 @@ class LatentRollout(nn.Module):
             else:
                 diffs = actions[2:] - 2 * actions[1:-1] + actions[:-2]
             
-            return (diffs ** 2).sum()
+            smooth_loss = (diffs ** 2).sum()
+
+        return smooth_loss + action_magnitude_penalty
     
     def total_cost(
         self,

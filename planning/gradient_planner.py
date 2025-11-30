@@ -260,6 +260,7 @@ class GradientPlanner(BasePlanner):
         
         return {
             'actions': best_actions,
+            'final_actions': actions.detach(),
             'trajectory': final_trajectory.detach(),
             'cost': final_cost.item(),
             'cost_history': cost_history,

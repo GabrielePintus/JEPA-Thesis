@@ -62,34 +62,7 @@ class MeNet6Decoder(nn.Module):
         return x
 
 
-class IDMDecoder(nn.Module):
-    """
-    Decoder for IDM state from latent representation.
-    Project C, H, W to 1, H, W using Conv2d.
-    """
-    
-    def __init__(self, input_channels=36, output_dim=2, hidden_dim=128):
-        super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(input_channels, input_channels*2, kernel_size=5, padding=1, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(input_channels*2, input_channels, kernel_size=3, padding=1, stride=1),
-            nn.ReLU(),
-            nn.Conv2d(input_channels, input_channels//2, kernel_size=3, padding=1, stride=1),
-            nn.ReLU(),
-            nn.Conv2d(input_channels//2, input_channels//4, kernel_size=3, padding=1, stride=1),
-        )
-        self.mlp = nn.Sequential(
-            nn.Linear(input_channels//4 * 12 * 12, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
-        )
-    
-    def forward(self, x):
-        out = self.cnn(x)  # (B, C, H', W')
-        out = out.flatten(1)  # (B, C*H'*W')
-        out = self.mlp(out)
-        return out
+
     
 class IDMDecoderConv(nn.Module):
     """
@@ -99,16 +72,24 @@ class IDMDecoderConv(nn.Module):
     
     def __init__(self, input_channels=36, output_dim=2, hidden_dim=24):
         super().__init__()
-        self.net = nn.Sequential(
+        self.conv = nn.Sequential(
             nn.Conv2d(input_channels, hidden_dim, kernel_size=5, padding=2, stride=1),
             nn.GroupNorm(8, hidden_dim),
             nn.ReLU(),
-            nn.Conv2d(hidden_dim, output_dim, kernel_size=3, padding=1, stride=1),
+            nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1, stride=1),
+        )
+        self.fc = nn.Sequential(
+            nn.LayerNorm(26 * 26),
+            nn.Linear(26 * 26, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim),
         )
     
     def forward(self, x):
-        return self.net(x)
-
+        x = self.conv(x)
+        x = x.flatten(1)
+        x = self.fc(x)
+        return x
 
 class ProprioDecoder(nn.Module):
     """

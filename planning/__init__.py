@@ -89,6 +89,7 @@ from .base_planner import BasePlanner, LatentRollout
 from .gradient_planner import GradientPlanner
 from .cmaes_planner import CMAESPlanner
 from .mppi_planner import MPPIPlanner
+from .bayesian_planner import BayesianPlanner
 from .mpc_controller import MPCController
 
 __all__ = [
@@ -107,6 +108,9 @@ __all__ = [
     # MPPI planners
     'MPPIPlanner',
     'MPPIPlannerWithElites',
+    
+    # Bayesian Optimization planner
+    'BayesianPlanner',
     
     # MPC controller
     'MPCController',

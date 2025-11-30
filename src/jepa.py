@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import lightning as L
 from torch.optim.lr_scheduler import LambdaLR
 
-from src.components.decoder import IDMDecoder, MeNet6Decoder, IDMDecoderConv
+from src.components.decoder import MeNet6Decoder, IDMDecoderConv
 from src.losses import TemporalVCRegLossOptimized as TemporalVCRegLoss
 from src.components.encoder import MeNet6, Expander2D, SmoothMeNet6
 from src.components.predictor import ConvPredictor
@@ -37,6 +37,7 @@ class JEPA(L.LightningModule):
         tvcreg_coeff: float = 1.0,
         prediction_cost_discount: float = 0.95,
         isometry_coeff: float = 0.1,
+        entropy_coeff: float = 0.1,
         
         # ============================================================================
         # Value function coefficients
@@ -82,8 +83,8 @@ class JEPA(L.LightningModule):
         # ========================================================================
         # self.visual_encoder = MeNet6(input_channels=3)
         self.visual_encoder = SmoothMeNet6(input_channels=3)
-        self.proprio_encoder = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=True)
-        self.action_encoder = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=True)
+        self.proprio_encoder = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=False)
+        self.action_encoder = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=False)
         
         self.visual_decoder = MeNet6Decoder(out_channels=3)
         self.idm_decoder = IDMDecoderConv(input_channels=36, output_dim=2)
@@ -94,9 +95,9 @@ class JEPA(L.LightningModule):
             out_channels=18,
         )
         
-        self.tvcreg_proj = nn.Sequential(
-            nn.Conv2d(18, 36, kernel_size=3, padding=1),
-        )
+        # self.tvcreg_proj = nn.Sequential(
+        #     nn.Conv2d(18, 36, kernel_size=3, padding=1),
+        # )
         self.tvcreg_loss = TemporalVCRegLoss(
             var_coeff=self.hparams.var_coeff,
             cov_coeff=self.hparams.cov_coeff,
@@ -109,7 +110,6 @@ class JEPA(L.LightningModule):
             self.visual_decoder = torch.compile(self.visual_decoder)
             self.predictor = torch.compile(self.predictor)
             self.idm_decoder = torch.compile(self.idm_decoder)
-            self.tvcreg_proj = torch.compile(self.tvcreg_proj)
 
     # ============================================================================
     # ENCODING (unchanged)
@@ -191,12 +191,38 @@ class JEPA(L.LightningModule):
         states, frames, actions = batch
         B, T, _ = actions.shape
 
-        states = states[..., 2:]  # Drop x,y
+        states = states[..., 2:]  # (B, T+1, 2)
 
         # ========================================================================
         # JEPA Forward Pass (unchanged)
         # ========================================================================
         z = self.encode_state(states, frames)  # (B, T+1, 18, 26, 26)
+        z_goal = z[:, -1].unsqueeze(1)  # (B, 1, 18, 26, 26)
+
+        # -----------------------------------------------------------
+        #   Entropy Regularization (on VISUAL embeddings only)
+        # -----------------------------------------------------------
+
+        # Separate visual channels
+        z_vis = z[:, :, :16]  # (B, T+1, 16, 26, 26)
+
+        # (Option A) Use the final timestep as the goal (recommended)
+        z_goal_entropy = z_vis[:, -1].unsqueeze(1)
+
+        # (Option B) Random goal from trajectory (your version)
+        # t_goal = torch.randint(1, T+1, (B,), device=z.device)
+        # z_goal_entropy = z_vis[torch.arange(B, device=z.device), t_goal].unsqueeze(1)
+
+        # Distances between each timestep and the chosen goal
+        distances = (z_vis - z_goal_entropy).pow(2).mean(dim=(2, 3, 4))  # (B, T+1)
+
+        # Softmax over timesteps inside trajectory
+        entropy_weights = F.softmax(-distances, dim=1)
+
+        # Entropy
+        entropy_loss = -(entropy_weights * torch.log(entropy_weights + 1e-10)).sum(dim=1).mean()
+
+
 
         # Reconstruction
         recon_frame = self.decode_visual(z.detach())
@@ -207,14 +233,11 @@ class JEPA(L.LightningModule):
         z_current = z[:, 0]
         for t in range(T):
             z_next_pred = self.predict_state(z_current, actions[:, t])
-            _prediction_loss = F.mse_loss(z_next_pred, z[:, t+1]) * (
+            _prediction_loss = F.mse_loss(z_next_pred, z[:, t+1].detach()) * (
                 self.hparams.prediction_cost_discount ** t
             )
             prediction_loss = _prediction_loss if prediction_loss is None else prediction_loss + _prediction_loss
             z_current = z_next_pred  # Use predicted state for next step
-
-        # Smoothness
-        smooth_loss = F.mse_loss(z[:, 1:], z[:, :-1])
 
         # Isometry
         h = self.encode_isometry(z)
@@ -229,14 +252,15 @@ class JEPA(L.LightningModule):
         t_j = time_pairs[:, :, 1, 0]
         target_distances = (t_i - t_j).abs()
         
-        cosine_similarity = F.cosine_similarity(pred_distances, target_distances, dim=-1)
+        cosine_similarity = F.cosine_similarity(pred_distances, target_distances / 500.0, dim=-1)
         isometry_loss = (1 - cosine_similarity).mean()
+        # isometry_loss = torch.tensor(0.0, device=z.device)
 
         # Temporal VCReg
-        z_proj = self.tvcreg_proj(z.flatten(0, 1))
-        z_proj = z_proj.view(B, T+1, 36, 26, 26).permute(0, 2, 1, 3, 4)
+        z_proj = z.flatten(0, 1)
+        z_proj = z_proj.view(B, T+1, 18, 26, 26).permute(0, 2, 1, 3, 4)
         z_proj = z_proj.flatten(0, 1)
-        z_proj = z_proj.view(B * 36, T+1, 26*26)
+        z_proj = z_proj.view(B * 18, T+1, 26*26)
         loss_tvcreg = self.tvcreg_loss(z_proj)
 
         # Inverse dynamics
@@ -244,9 +268,7 @@ class JEPA(L.LightningModule):
         idm_in_2 = z[:, 1:].flatten(0, 1)
         idm_in = torch.cat([idm_in_1, idm_in_2], dim=1)
         idm_pred = self.idm_decoder(idm_in)
-        actions_expanded = actions.flatten(0, 1)
-        actions_expanded = self.action_encoder(actions_expanded)
-        idm_loss = F.mse_loss(idm_pred, actions_expanded)
+        idm_loss = F.mse_loss(idm_pred, actions.flatten(0, 1))
 
         # Smooth loss
         smooth_loss = self.cosine_loss(z[:, 1:], z[:, :-1])
@@ -259,7 +281,8 @@ class JEPA(L.LightningModule):
             smooth_loss * self.hparams.smooth_coeff +
             isometry_loss * self.hparams.isometry_coeff +
             loss_tvcreg['loss'] * self.hparams.tvcreg_coeff +
-            idm_loss * self.hparams.idm_coeff
+            idm_loss * self.hparams.idm_coeff + 
+            entropy_loss * self.hparams.entropy_coeff
         )
         
         total_loss = recon_loss + jepa_loss
@@ -310,7 +333,6 @@ class JEPA(L.LightningModule):
                     "params": list(self.visual_encoder.parameters()) +
                               list(self.proprio_encoder.parameters()) +
                               list(self.action_encoder.parameters()) +
-                              list(self.tvcreg_proj.parameters()) +
                               list(self.idm_decoder.parameters()),
                     "lr": self.hparams.initial_lr_encoder,
                     "weight_decay": self.hparams.weight_decay_encoder,
