@@ -9,7 +9,7 @@ class ConvPredictor(nn.Module):
         self.activation = nn.ReLU()
 
         self.net = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=5, stride=1, padding=2),
             nn.GroupNorm(4, hidden_channels),
             self.activation,
 

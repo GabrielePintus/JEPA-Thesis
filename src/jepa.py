@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import lightning as L
 from torch.optim.lr_scheduler import LambdaLR
 
-from src.components.decoder import MeNet6Decoder, IDMDecoderConv
+from src.components.decoder import MeNet6Decoder, IDMDecoderConv, PositionDecoder
 from src.losses import TemporalVCRegLossOptimized as TemporalVCRegLoss
 from src.components.encoder import MeNet6, Expander2D, SmoothMeNet6
 from src.components.predictor import ConvPredictor
@@ -81,14 +81,13 @@ class JEPA(L.LightningModule):
         # ========================================================================
         # JEPA Components (unchanged)
         # ========================================================================
-        # self.visual_encoder = MeNet6(input_channels=3)
         self.visual_encoder = SmoothMeNet6(input_channels=3)
         self.proprio_encoder = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=False)
         self.action_encoder = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=False)
         
         self.visual_decoder = MeNet6Decoder(out_channels=3)
         self.idm_decoder = IDMDecoderConv(input_channels=36, output_dim=2)
-        
+        self.position_decoder = PositionDecoder(in_channels=16)
         self.predictor = ConvPredictor(
             in_channels=20,
             hidden_channels=32,
@@ -110,6 +109,7 @@ class JEPA(L.LightningModule):
             self.visual_decoder = torch.compile(self.visual_decoder)
             self.predictor = torch.compile(self.predictor)
             self.idm_decoder = torch.compile(self.idm_decoder)
+            self.position_decoder = torch.compile(self.position_decoder)
 
     # ============================================================================
     # ENCODING (unchanged)
@@ -192,36 +192,39 @@ class JEPA(L.LightningModule):
         B, T, _ = actions.shape
 
         states = states[..., 2:]  # (B, T+1, 2)
+        positions = states[..., :2]  # (B, T+1, 2)
 
         # ========================================================================
         # JEPA Forward Pass (unchanged)
         # ========================================================================
         z = self.encode_state(states, frames)  # (B, T+1, 18, 26, 26)
-        z_goal = z[:, -1].unsqueeze(1)  # (B, 1, 18, 26, 26)
 
-        # -----------------------------------------------------------
-        #   Entropy Regularization (on VISUAL embeddings only)
-        # -----------------------------------------------------------
+        # # -----------------------------------------------------------
+        # #   Global Repulsion Loss (for far-away states)
+        # # -----------------------------------------------------------
+        # z_vis = z[:, :, :16, :, :]  # (B, T+1, 16, 26, 26)
 
-        # Separate visual channels
-        z_vis = z[:, :, :16]  # (B, T+1, 16, 26, 26)
+        # # collapse spatial dims → vector embeddings
+        # z_vec = z_vis.mean(dim=(3,4)).flatten(0,1)     # (B*(T+1), 16)
 
-        # (Option A) Use the final timestep as the goal (recommended)
-        z_goal_entropy = z_vis[:, -1].unsqueeze(1)
+        # # sample arbitrary global pairs
+        # N = z_vec.shape[0]
+        # perm = torch.randperm(N, device=z.device)
+        # half = N // 2
+        # z1 = z_vec[perm[:half]]
+        # z2 = z_vec[perm[half: 2*half]]
 
-        # (Option B) Random goal from trajectory (your version)
-        # t_goal = torch.randint(1, T+1, (B,), device=z.device)
-        # z_goal_entropy = z_vis[torch.arange(B, device=z.device), t_goal].unsqueeze(1)
+        # # repulsion margin
+        # margin = 2.0
+        # d = (z1 - z2).pow(2).sum(dim=1)
+        # repulsion_loss = F.relu(margin - d).mean()
 
-        # Distances between each timestep and the chosen goal
-        distances = (z_vis - z_goal_entropy).pow(2).mean(dim=(2, 3, 4))  # (B, T+1)
-
-        # Softmax over timesteps inside trajectory
-        entropy_weights = F.softmax(-distances, dim=1)
-
-        # Entropy
-        entropy_loss = -(entropy_weights * torch.log(entropy_weights + 1e-10)).sum(dim=1).mean()
-
+        # Predict position
+        pos_pred = self.position_decoder(z.flatten(0,1)[:, :16])[0]
+        pos_loss = F.mse_loss(
+            pos_pred,
+            positions.flatten(0,1),
+        )
 
 
         # Reconstruction
@@ -268,7 +271,8 @@ class JEPA(L.LightningModule):
         idm_in_2 = z[:, 1:].flatten(0, 1)
         idm_in = torch.cat([idm_in_1, idm_in_2], dim=1)
         idm_pred = self.idm_decoder(idm_in)
-        idm_loss = F.mse_loss(idm_pred, actions.flatten(0, 1))
+        # idm_loss = F.mse_loss(idm_pred, actions.flatten(0, 1))
+        idm_loss = self.cosine_loss(idm_pred, actions.flatten(0, 1))
 
         # Smooth loss
         smooth_loss = self.cosine_loss(z[:, 1:], z[:, :-1])
@@ -282,7 +286,7 @@ class JEPA(L.LightningModule):
             isometry_loss * self.hparams.isometry_coeff +
             loss_tvcreg['loss'] * self.hparams.tvcreg_coeff +
             idm_loss * self.hparams.idm_coeff + 
-            entropy_loss * self.hparams.entropy_coeff
+            pos_loss * self.hparams.entropy_coeff
         )
         
         total_loss = recon_loss + jepa_loss
@@ -301,6 +305,7 @@ class JEPA(L.LightningModule):
             'loss_tvcreg_var': loss_tvcreg['var-loss'],
             'loss_tvcreg_cov': loss_tvcreg['cov-loss'],
             "idm_loss": idm_loss,
+            "pos_loss": pos_loss,
         }
         
         if stage == 'train':
@@ -333,7 +338,8 @@ class JEPA(L.LightningModule):
                     "params": list(self.visual_encoder.parameters()) +
                               list(self.proprio_encoder.parameters()) +
                               list(self.action_encoder.parameters()) +
-                              list(self.idm_decoder.parameters()),
+                              list(self.position_decoder.parameters()) +
+                              list(self.idm_decoder.parameters()), 
                     "lr": self.hparams.initial_lr_encoder,
                     "weight_decay": self.hparams.weight_decay_encoder,
                 },

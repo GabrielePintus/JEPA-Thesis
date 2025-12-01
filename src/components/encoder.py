@@ -60,6 +60,25 @@ class SmoothMeNet6(nn.Module):
         return self.net(x)
 
 
+class MaskHead(nn.Module):
+    """
+    Predict a soft subject mask M in [0,1] from visual features.
+
+    Input:  (B, C, H, W)   e.g. C=16, H=W=26
+    Output: (B, 1, H, W)   logits; apply sigmoid outside if needed
+    """
+    def __init__(self, in_channels=16, hidden_channels=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(4, hidden_channels),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+        )
+
+    def forward(self, z):
+        # z: (B, C, H, W)
+        return self.net(z)  # (B, 1, H, W) (logits)
 
 
 

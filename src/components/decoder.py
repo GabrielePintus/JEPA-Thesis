@@ -12,12 +12,12 @@ class MeNet6Decoder(nn.Module):
     This is ONLY for visualization — it does not need to be a perfect inverse.
     """
 
-    def __init__(self, out_channels=3):
+    def __init__(self, out_channels=3, in_channels=16):
         super().__init__()
 
         # 1) Reverse last Conv1x1 (16 → 32)
         self.up1 = nn.Sequential(
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
             nn.GELU(),
         )
 
@@ -120,6 +120,72 @@ class ProprioDecoder(nn.Module):
         return out
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+
+class PositionDecoder(nn.Module):
+    """
+    Predict 2D coordinates in a learned continuous coordinate system.
+
+    Architecture:
+        f (B,C,H,W)
+          → Conv2d (3x3)
+          → GroupNorm
+          → Activation
+          → Conv2d (1x1) → heatmap
+          → soft-argmax over learnable coordinate grid
+    """
+    def __init__(self, in_channels=16, H=26, W=26, hidden_channels=32):
+        super().__init__()
+
+        # ---------------------------
+        # Extra Conv + Norm + Act
+        # ---------------------------
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups=4, num_channels=hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1)
+        )
+
+        # ---------------------------
+        # Learnable coordinate grid
+        # (2, H, W) → (x_grid, y_grid)
+        # ---------------------------
+        self.coord_grid = nn.Parameter(
+            torch.randn(2, H, W) * 0.1
+        )
+
+    def forward(self, f):
+        """
+        Args:
+            f: (B, C, H, W) feature map
+
+        Returns:
+            coords: (B, 2) learned continuous coordinates (x, y)
+            heatmap: (B, 1, H, W)
+        """
+        B, _, H, W = f.shape
+
+        # Extra conv block
+        heatmap = self.conv(f)   # (B, hidden_channels, H, W)
+
+        # Softmax over spatial locations
+        prob = F.softmax(
+            heatmap.view(B, -1), dim=1
+        ).view(B, 1, H, W)
+
+        # Learned coordinate system
+        x_grid = self.coord_grid[0]  # (H, W)
+        y_grid = self.coord_grid[1]
+
+        # Expected value in learned coordinate basis
+        x = (prob[:, 0] * x_grid).sum(dim=(1, 2))
+        y = (prob[:, 0] * y_grid).sum(dim=(1, 2))
+
+        coords = torch.stack([x, y], dim=1)
+        return coords, heatmap
 
 

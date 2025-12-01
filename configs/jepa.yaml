@@ -10,24 +10,24 @@ trainer:
   # gradient_clip_algorithm: norm
   # gradient accumulation (accumulate gradients for N steps before optimizer step)
   accumulate_grad_batches: 2
-  callbacks:
-  - class_path: lightning.pytorch.callbacks.ModelCheckpoint
-    init_args:
-      dirpath: checkpoints/jepa
-      filename: "JEPA-{epoch:03d}-{val/jepa_loss:.4f}"
-      monitor: val/jepa_loss
-      mode: min
-      save_top_k: 1                          # best checkpoint
-      save_last: true                      # plus a copy of the final epoch
-      auto_insert_metric_name: false       # keep filename clean
-      every_n_epochs: 1
-      save_on_train_epoch_end: true
-  logger:
-    class_path: lightning.pytorch.loggers.WandbLogger
-    init_args:
-      project: "JEPA"
-      name: "PointMaze/JEPA"
-      log_model: true
+  # callbacks:
+  # - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+  #   init_args:
+  #     dirpath: checkpoints/jepa
+  #     filename: "JEPA-{epoch:03d}-{val/jepa_loss:.4f}"
+  #     monitor: val/jepa_loss
+  #     mode: min
+  #     save_top_k: 1                          # best checkpoint
+  #     save_last: true                      # plus a copy of the final epoch
+  #     auto_insert_metric_name: false       # keep filename clean
+  #     every_n_epochs: 1
+  #     save_on_train_epoch_end: true
+  # logger:
+  #   class_path: lightning.pytorch.loggers.WandbLogger
+  #   init_args:
+  #     project: "JEPA"
+  #     name: "PointMaze/JEPA"
+  #     log_model: true
 
 
 model:
@@ -40,34 +40,38 @@ model:
   # cov_coeff:    15.5
   cov_coeff:      0.0
   var_coeff:      0.0
-  smooth_coeff:   0.0
-  isometry_coeff: 0.0
-  idm_coeff:      2.0
-  entropy_coeff:  0.0
+  # smooth_coeff:   0.0
+  idm_coeff:      1.0
+
+  # Mask coefs
+  mask_bg_coeff: 1.0       # weight for background invariance loss
+  mask_align_coeff: 1.0    # weight for alignment with temporal diffs
+  mask_area_coeff: 0.1     # weight for min-area hinge
+  mask_smooth_coeff: 0.1   # weight for spatial TV on mask
+  mask_min_area: 0.01      # minimal fraction of image as subject
 
   # Optimization hyperparameters
-  # initial_lr_encoder:     1e-2
   initial_lr_encoder:     5e-3
   final_lr_encoder:       1e-7
-  weight_decay_encoder:   1e-4
+  weight_decay_encoder:   0
 
-  initial_lr_decoder:     1e-2
-  final_lr_decoder:       1e-5
-  weight_decay_decoder:   0
+  # initial_lr_decoder:     1e-2
+  # final_lr_decoder:       1e-5
+  # weight_decay_decoder:   0
 
   initial_lr_predictor:   1e-2
   final_lr_predictor:     1e-7
-  weight_decay_predictor: 1e-4
+  weight_decay_predictor: 0
 
   warmup_steps: 100
 
   # Misc
-  compile: true
+  compile: false
 
 
 data:
   data_path: data/train_trajectories_200_100_4_64_largerdot_singlelayout.npz
-  batch_size: 96
+  batch_size: 64
   num_workers: 2
   pin_memory: true
   val_size: 0.1
