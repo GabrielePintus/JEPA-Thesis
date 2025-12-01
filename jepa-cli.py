@@ -1,6 +1,6 @@
 import torch
 from lightning.pytorch.cli import LightningCLI
-from src.jepa import JEPA
+from src.jepa2 import JEPA
 from src.data.datamodule import PointMazeSequencesDataModule
 # import os
 
