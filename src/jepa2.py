@@ -61,9 +61,9 @@ class JEPA(L.LightningModule):
         # ========================================================================
         # Encoders
         # ========================================================================
-        self.visual_encoder = SmoothMeNet6(input_channels=3)
-        self.proprio_encoder = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=False)
-        self.action_encoder = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=False)
+        self.visual_encoder     = SmoothMeNet6(input_channels=3)
+        self.proprio_encoder    = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=False)
+        self.action_encoder     = Expander2D(target_shape=(26, 26), out_channels=2, use_batchnorm=False)
         
         # ========================================================================
         # Mask head
@@ -82,11 +82,20 @@ class JEPA(L.LightningModule):
         # Subject/Background refinement nets
         # ========================================================================
         self.subject_refine = nn.Sequential(
-            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.Conv2d(16, 16, kernel_size=5, padding=2),
         )
         
+        # self.background_refine = nn.Sequential(
+        #     nn.Conv2d(16, 16, kernel_size=1, padding=0),
+        # )
         self.background_refine = nn.Sequential(
-            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.GroupNorm(4, 32),
+            nn.GELU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.GroupNorm(4, 32),
+            nn.GELU(),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
         )
         
         # ========================================================================
@@ -104,7 +113,7 @@ class JEPA(L.LightningModule):
         # Stabilizer (prevents residual explosion in autoregressive rollouts)
         # ========================================================================
         self.stabilizer = nn.Sequential(
-            nn.Conv2d(18, 18, kernel_size=3, padding=1),
+            nn.Conv2d(18, 18, kernel_size=5, padding=2),
         )
         
         # ========================================================================
@@ -114,15 +123,15 @@ class JEPA(L.LightningModule):
         self.idm_decoder = IDMDecoderConv(input_channels=36, output_dim=2)
 
         if compile:
-            self.visual_encoder = torch.compile(self.visual_encoder)
-            self.proprio_encoder = torch.compile(self.proprio_encoder)
-            self.action_encoder = torch.compile(self.action_encoder)
-            self.mask_head = torch.compile(self.mask_head)
-            self.subject_refine = torch.compile(self.subject_refine)
-            self.background_refine = torch.compile(self.background_refine)
-            self.predictor = torch.compile(self.predictor)
-            self.stabilizer = torch.compile(self.stabilizer)
-            self.idm_decoder = torch.compile(self.idm_decoder)
+            self.visual_encoder     = torch.compile(self.visual_encoder)
+            self.proprio_encoder    = torch.compile(self.proprio_encoder)
+            self.action_encoder     = torch.compile(self.action_encoder)
+            self.mask_head          = torch.compile(self.mask_head)
+            self.subject_refine     = torch.compile(self.subject_refine)
+            self.background_refine  = torch.compile(self.background_refine)
+            self.predictor          = torch.compile(self.predictor)
+            self.stabilizer       = torch.compile(self.stabilizer)
+            self.idm_decoder        = torch.compile(self.idm_decoder)
 
     # ============================================================================
     # ENCODING
@@ -258,7 +267,7 @@ class JEPA(L.LightningModule):
         Returns:
             z_next: (B, 18, 26, 26) - predicted next latent state
         """
-        B, C, H, W = z.shape
+        _, C, _, _ = z.shape
         assert C == 18, f"Expected 18 channels (16 visual + 2 vel), got {C}"
 
         # Split into visual + velocity
@@ -266,7 +275,7 @@ class JEPA(L.LightningModule):
         z_vel = z[:, 16:]   # (B, 2, H, W)
 
         # Compute mask and split (with refinement)
-        M, z_subj, z_bg = self.compute_mask_and_split(z_vis)
+        _, z_subj, z_bg = self.compute_mask_and_split(z_vis)
 
         # Background is static geometry - detach from prediction gradient
         z_bg_detached = z_bg.detach()
@@ -287,6 +296,9 @@ class JEPA(L.LightningModule):
         
         # Stabilize to prevent explosion in autoregressive rollouts
         z_next = self.stabilizer(z_next)
+
+        # # Experiment: predict full next state instead of residual
+        # z_next = self.predictor(pred_input)  # (B, 18, H, W)
 
         return z_next
 
@@ -315,8 +327,13 @@ class JEPA(L.LightningModule):
         z_bg = (1.0 - M) * z_vis                    # (B, T+1, 16, H, W)
         z_bg_t = z_bg[:, :-1]                       # (B, T, 16, H, W)
         z_bg_tp1 = z_bg[:, 1:].detach()             # stop gradient on target
+
+        # Pixel-wise invariance loss
+        mask_bg_invariance_pixel = F.mse_loss(z_bg_t, z_bg_tp1)
+        # Item-wise invariance loss
+        mask_bg_invariance_item = F.mse_loss(z_bg_t.mean(dim=(2, 3, 4)), z_bg_tp1.mean(dim=(2, 3, 4)))
         
-        losses['mask_bg_invariance'] = F.mse_loss(z_bg_t, z_bg_tp1)
+        losses['mask_bg_invariance'] = 0.5 * (mask_bg_invariance_pixel + mask_bg_invariance_item)
         
         # ========================================================================
         # 2. Alignment: subject mask should cover regions with high temporal change
@@ -349,11 +366,11 @@ class JEPA(L.LightningModule):
         losses['mask_compactness'] = tv_h + tv_v
         
         # ========================================================================
-        # 5. Sparsity: encourage mask to be small (L1 penalty on mask values)
+        # 5. Sparsity: encourage mask to be small (Bernoullian variance reduction)
         # ========================================================================
         # This penalizes the total area covered by the subject
         # Works in tension with mask_min_area to find minimal sufficient coverage
-        losses['mask_sparsity'] = M.mean()
+        losses['mask_sparsity'] = (M * (1.0 - M)).mean()
         
         return losses
 
