@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from flash_attn import flash_attn_func
 
 
 class ConvPredictor(nn.Module):
@@ -13,7 +12,7 @@ class ConvPredictor(nn.Module):
             nn.GroupNorm(4, hidden_channels),
             self.activation,
 
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=5, stride=1, padding=2),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1),
             nn.GroupNorm(4, hidden_channels),
             self.activation,
 

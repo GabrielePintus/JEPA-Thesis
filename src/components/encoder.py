@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from flash_attn import flash_attn_func
+# from flash_attn import flash_attn_func
 import math
-from rotary_embedding_torch import RotaryEmbedding
+# from rotary_embedding_torch import RotaryEmbedding
 
 #
 #   VLAD's Models
@@ -73,7 +73,7 @@ class MaskHead(nn.Module):
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GroupNorm(4, hidden_channels),
             nn.ReLU(),
-            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1, padding=0),
         )
 
     def forward(self, z):
