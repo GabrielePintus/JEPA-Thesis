@@ -10,7 +10,7 @@ from collections import deque
 from typing import List
 
 def _is_connected(free_mask: np.ndarray) -> bool:
-    """Check 4-neighborhood connectivity of 1's in free_mask (H×W)."""
+    """Check 4-neighborhood connectivity of 1's in free_mask (HxW)."""
     H, W = free_mask.shape
     coords = np.argwhere(free_mask == 1)
     if coords.size == 0:
@@ -36,7 +36,7 @@ def sample_interior_layout(
     max_free_ratio: float = 0.75,
     max_tries: int = 5000,
 ) -> np.ndarray:
-    """Return an H×W interior mask with 1=free, 0=wall, meeting free ratio and connectivity."""
+    """Return an HxW interior mask with 1=free, 0=wall, meeting free ratio and connectivity."""
     total = H * W
     min_free = int(np.ceil(min_free_ratio * total))
     max_free = int(np.floor(max_free_ratio * total))
@@ -54,7 +54,7 @@ def sample_interior_layout(
 
 
 def interior_to_full_with_border(interior: np.ndarray) -> np.ndarray:
-    """Convert H×W interior (1=free,0=wall) to (H+2)×(W+2) full map with border, using 1=wall,0=free."""
+    """Convert HxW interior (1=free,0=wall) to (H+2)x(W+2) full map with border, using 1=wall,0=free."""
     H, W = interior.shape
     full = np.ones((H + 2, W + 2), dtype=int)
     full[1:-1, 1:-1] = 1 - interior  # invert: interior 1->free(0), 0->wall(1)

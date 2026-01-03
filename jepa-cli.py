@@ -1,11 +1,8 @@
 import torch
 from lightning.pytorch.cli import LightningCLI
-from src.jepa2 import JEPA
+from src.jepa import JEPA
 from src.data.datamodule import PointMazeSequencesDataModule
-# import os
 
-
-# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 SEED = 0
 
