@@ -10,7 +10,7 @@ Supervisors: Prof. Luca Bortolussi, Prof. Alfredo Canziani (NYU)
 
 You can find the full thesis [here](resources/Thesis.pdf) and the slides [here](resources/Slides.pdf).
 
----
+
 
 ## 📘 Abstract
 
@@ -18,7 +18,7 @@ Autonomous agents require internal models of the world to predict, reason, and p
 
 In this work, we study a JEPA-based world model for goal-conditioned visual navigation in the **PointMaze** environment. We introduce a learned **static–dynamic decomposition** via a mask that separates background structure from agent-dependent dynamics. The dynamics predictor operates exclusively on the dynamic latent component, improving robustness and predictability. The learned world model is integrated into a **Model Predictive Control (MPPI)** pipeline that performs planning entirely in latent space, achieving reliable navigation without access to ground-truth positions, maps, or rewards.
 
----
+
 
 ## 🧠 Key Contributions
 
@@ -28,7 +28,7 @@ In this work, we study a JEPA-based world model for goal-conditioned visual navi
 * **Planning with MPPI entirely in representation space**
 * Successful generalization to **unseen mazes** with frequent replanning
 
----
+
 
 ## 🏗️ Architecture Overview
 
@@ -41,7 +41,7 @@ The system consists of:
 
 Prediction is performed in representation space, avoiding pixel-level reconstruction and focusing only on predictable structure.
 
----
+
 
 ## 🌍 Environment & Data
 
@@ -62,37 +62,48 @@ Prediction is performed in representation space, avoiding pixel-level reconstruc
 * 40 training mazes + 40 test mazes
 * Collected with random exploration policies
 
----
+
 
 ## 🧪 Experiments & Results
 
 * The learned mask correctly identifies **dynamic regions** corresponding to the agent
+
+<div style="width: 600px; margin: 0 auto;">
+
+![Mask Visualization](resources/results_mask.png)
+</div>
+
 * The latent space encodes **spatial geometry** and relative position
 * MPPI planning in latent space achieves:
 
   * **Near-100% success rate** with frequent replanning
   * Robust generalization to unseen maze layouts
 
----
+
+<div style="width: 600px; margin: 0 auto;">
+
+![Mask Visualization](resources/results_trajectories.png)
+</div>
+
 
 ## 📂 Repository Structure
 
 ```
 .
-├── configs/            # Experiment and model configuration files
-├── data/               # Dataset generation and preprocessing
-├── models/             # Encoder, predictor, mask networks
-├── training/           # JEPA training loops and losses
-├── planning/           # MPPI planner and latent-space cost functions
-├── experiments/        # Evaluation scripts and analysis
-├── figures/            # Plots and visualizations used in the thesis
-├── README.md
-└── thesis/             # PDF of the thesis and defense slides
+├── configs/                # Lightning configuration files
+├── data/                   # Datasets generated with trajectory_generator.py
+├── env/                    # PointMaze environment code
+├── src/                    # Main source code (models, training, planning, datasets)
+├── resources/              # Thesis, slides and images
+├── README.md               # This file
+├── jepa-cli.py             # Main Lightning CLI entry point
+├── make_maze_bank.py       # Maze generation script
+├── split_maze_bank.py      # Script to split maze bank into train/test sets
+├── trajectory_generator.py # Script to generate dataset trajectories
+└── Visualization.ipynb     # Jupyter notebook for visualizing trained model
 ```
 
-*(Folder names may vary depending on the final cleanup of the repo.)*
 
----
 
 ## 🚀 Training the model
 
@@ -103,7 +114,6 @@ python jepa-cli.py --config configs/jepa.yaml
 > ⚠️ This repository is primarily intended for research and reproducibility rather than as a polished library.
 
 
----
 
 ## 🔭 Limitations & Future Work
 
@@ -115,7 +125,7 @@ python jepa-cli.py --config configs/jepa.yaml
   * Uncertainty-aware latent dynamics
   * Hierarchical and multi-scale JEPA models
 
----
+
 
 ## 📚 References
 
